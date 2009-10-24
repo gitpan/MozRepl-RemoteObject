@@ -1,0 +1,18 @@
+.cvsignore$
+^.lwpcookies
+^.releaserc
+^blib/
+^MozRepl-RemoteObject-.*
+CVS/
+^pm_to_blib
+.tar.gz$
+\.old$
+^Makefile$
+^cvstest$
+^blibdirs$
+# Version control files and dirs.
+\bRCS\b
+\bCVS\b
+,v$
+\B\.svn\b
+\B\.git\b

@@ -1,0 +1,6 @@
+Makefile
+Makefile.old
+*.tar.gz
+pm_to_blib
+blib/
+.releaserc

@@ -1,0 +1,27 @@
+--- #YAML:1.0
+name:               MozRepl-RemoteObject
+version:            0.01
+abstract:           treat Javascript objects as Perl objects
+author:
+    - Max Maischein <corion@cpan.org>
+license:            unknown
+distribution_type:  module
+configure_requires:
+    ExtUtils::MakeMaker:  0
+build_requires:
+    ExtUtils::MakeMaker:  0
+requires:
+    Encode:          0
+    File::Basename:  0
+    JSON:            2
+    MozRepl:         0.06
+    parent:          0
+    Scalar::Util:    0
+no_index:
+    directory:
+        - t
+        - inc
+generated_by:       ExtUtils::MakeMaker version 6.50
+meta-spec:
+    url:      http://module-build.sourceforge.net/META-spec-v1.4.html
+    version:  1.4
