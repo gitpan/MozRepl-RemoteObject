@@ -1,17 +1,9 @@
 package MozRepl::RemoteObject;
 use strict;
 
-use Scalar::Util qw(blessed refaddr);
-use File::Basename;
 use JSON;
 use Carp qw(croak cluck);
 use MozRepl;
-
-use overload '%{}' => '__as_hash',
-             '@{}' => '__as_array',
-             '&{}' => '__as_code',
-             '=='  => '__object_identity',
-             '""'  => sub { overload::StrVal $_[0] };
 
 =head1 NAME
 
@@ -27,8 +19,7 @@ MozRepl::RemoteObject - treat Javascript objects as Perl objects
     my $repl = MozRepl::RemoteObject->install_bridge();
     
     # get our root object:
-    my $rn = $repl->repl;
-    my $tab = MozRepl::RemoteObject->expr(<<JS);
+    my $tab = $repl->expr(<<JS);
         window.getBrowser().addTab()
     JS
 
@@ -47,8 +38,8 @@ MozRepl::RemoteObject - treat Javascript objects as Perl objects
 
 =cut
 
-use vars qw[$VERSION $repl $objBridge $json];
-$VERSION = '0.01';
+use vars qw[$VERSION $objBridge];
+$VERSION = '0.02';
 
 # This should go into __setup__ and attach itself to $repl as .link()
 $objBridge = <<JS;
@@ -117,30 +108,30 @@ repl.callThis = function(id,args) {
 
 repl.callMethod = function(id,fn,args) { 
     var obj = repl.getLink(id);
-    fn = obj[fn];
-    return repl.wrapResults( fn.apply(obj, args));
+    var f = obj[fn];
+    if (! f) {
+        throw "Object has no function " + fn;
+    }
+    return repl.wrapResults( f.apply(obj, args));
 };
 })([% rn %]);
 JS
 
-$json = JSON->new->allow_nonref; # ->utf8;
-
 # Take a JSON response and convert it to a Perl data structure
-# This should go into its own package to clean up the namespace
-sub to_perl($) {
-    local $_ = shift;
+sub to_perl {
+    my ($self,$js) = @_;
+    local $_ = $js;
     s/^"//;
     s/"$//;
     # reraise JS errors from perspective of caller
     if (/^!!!\s+(.*)$/m) {
         croak "MozRepl::RemoteObject: $1";
     };
-    $json->decode($_);
+    $self->json->decode($_);
 };
 
 # Unwrap the result, will in the future also be used
 # to handle async events
-# This should go into its own package to clean up the namespace
 sub unwrap_json_result {
     my ($self,$data) = @_;
     if ($data->{type}) {
@@ -150,7 +141,16 @@ sub unwrap_json_result {
     };
 };
 
-=head2 C<< MozRepl::RemoteObject->install_bridge [$repl] >>
+# Call JS and return the unwrapped result
+sub unjson {
+    my ($self,$js) = @_;
+    my $data = $self->js_call_to_perl_struct($js);
+    return $self->unwrap_json_result($data);    
+};
+
+=head1 BRIDGE SETUP
+
+=head2 C<< MozRepl::RemoteObject->install_bridge %options >>
 
 Installs the Javascript C<< <-> >> Perl bridge. If you pass in
 an existing L<MozRepl> instance, it must have L<MozRepl::Plugin::JSON2>
@@ -159,20 +159,23 @@ loaded.
 By default, MozRepl::RemoteObject will set up its own MozRepl instance
 and store it in $MozRepl::RemoteObject::repl .
 
-If C<$repl> is not passed in, C<$ENV{MOZREPL}> will be used
+If C<repl> is not passed in, C<$ENV{MOZREPL}> will be used
 to find the ip address and portnumber to connect to. If C<$ENV{MOZREPL}>
 is not set, the default of C<localhost:4242> will be used.
 
-If C<$repl> is not a reference, it will be used instead of C<$ENV{MOZREPL}>.
+If C<repl> is not a reference, it will be used instead of C<$ENV{MOZREPL}>.
 
-=head3 Example
+To replace the default JSON parser, you can pass it in using the C<json>
+option.
+
+=head3 Connect to a different machine
 
 If you want to connect to a Firefox instance on a different machine,
 call C<< ->install_bridge >> as follows:
 
     MozRepl::RemoteObject->install_bridge("$remote_machine:4242");
 
-=head3 Example
+=head3 Using an existing MozRepl
 
 If you want to pass in a preconfigured L<MozRepl> object,
 call C<< ->install_bridge >> as follows:
@@ -182,33 +185,26 @@ call C<< ->install_bridge >> as follows:
         log => [qw/ error info /],
         plugins => { plugins => [qw[ JSON2 ]] },
     });
-    MozRepl::RemoteObject->install_bridge($repl);
+    my $bridge = MozRepl::RemoteObject->install_bridge(repl => $repl);
 
 =cut
 
 sub install_bridge {
-    my ($package, $_repl) = @_;
-    return # already installed
-        if (! $_repl and $repl);
-    if ($_repl and ref $repl) {
-        cluck "Overwriting existing object bridge"
-            if ($repl and refaddr $repl != refaddr $_repl);
-    };
+    my ($package, %options) = @_;
+    $options{ repl } ||= $ENV{MOZREPL};
     
-    $_repl ||= $ENV{MOZREPL};    
-    
-    if (! ref $_repl) { # we have host:port
+    if (! ref $options{repl}) { # we have host:port
         my @host_port;
-        if (defined $_repl) {
-            $_repl =~ /^(.*):(\d+)$/
-                or croak "Couldn't find host:port from [$_repl].";
+        if (defined $options{repl}) {
+            $options{repl} =~ /^(.*):(\d+)$/
+                or croak "Couldn't find host:port from [$options{repl}].";
             push @host_port, host => $1
                 if defined $1;
             push @host_port, port => $2
                 if defined $2;
         };
-        $_repl = MozRepl->new();
-        $_repl->setup({
+        $options{repl} = MozRepl->new();
+        $options{repl}->setup({
             client => {
                 @host_port,
                 extra_client_args => {
@@ -220,22 +216,24 @@ sub install_bridge {
             plugins => { plugins => [qw[ JSON2 ]] }, # I'm loading my own JSON serializer
         });
     };
-    $repl = $_repl;
     
-    my $rn = $repl->repl;
+    my $rn = $options{repl}->repl;
+    $options{ json } ||= JSON->new->allow_nonref; # ->utf8;
 
     # Load the JS side of the JS <-> Perl bridge
     for my $c ($objBridge) {
         $c = "$c"; # make a copy
         $c =~ s/\[%\s+rn\s+%\]/$rn/g; # cheap templating
         next unless $c =~ /\S/;
-        $repl->execute($c);
+        $options{repl}->execute($c);
     };
+    
+    $options{ functions } = {}; # cache
 
-    $repl
+    bless \%options, $package
 };
 
-=head2 C<< MozRepl::RemoteObject->expr $js >>
+=head2 C<< $bridge->expr $js >>
 
 Runs the Javascript passed in through C< $js > and links
 the returned result to a Perl object or a plain
@@ -244,12 +242,12 @@ value, depending on the type of the Javascript result.
 This is how you get at the initial Javascript object
 in the object forest.
 
-  my $window = MozRepl::RemoteObject->expr('window');
+  my $window = $bridge->expr('window');
   print $window->{title};
   
 You can also create Javascript functions and use them from Perl:
 
-  my $add = MozRepl::RemoteObject->expr(<<JS);
+  my $add = $bridge->expr(<<JS);
       function (a,b) { return a+b }
   JS
   print $add->(2,3);
@@ -257,19 +255,92 @@ You can also create Javascript functions and use them from Perl:
 =cut
 
 sub expr {
-    my $package = shift;
-    $package = ref $package || $package;
-    my $js = shift;
-    $js = $json->encode($js);
-    my $rn = $repl->repl;
+    my ($self,$js) = @_;
+    $js = $self->json->encode($js);
+    my $rn = $self->repl->repl;
     $js = <<JS;
     (function(repl,code) {
         return repl.wrapResults(eval(code))
     })($rn,$js)
 JS
-    my $data = js_call_to_perl_struct($js);
-    return $package->unwrap_json_result($data);
+    return $self->unjson($js);
 }
+
+sub link_ids {
+    my $self = shift;
+    map {
+        $_ ? MozRepl::RemoteObject::Instance->new( $self, $_ )
+           : undef
+    } @_
+}
+
+=head2 C<< $bridge->js_call_to_perl_struct $js >>
+
+Takes a scalar with JS code, executes it, and returns
+the result as a Perl structure.
+
+This will not (yet?) cope with objects on the remote side, so you
+will need to make sure to call C<< $rn.link() >> on all objects
+that are to persist across the bridge.
+
+This is a very low level method. You are better advised to use
+C<< $bridge->expr() >> as that will know
+to properly wrap objects but leave other values alone.
+
+=cut
+
+# This should go into its own package to clean up the namespace
+sub js_call_to_perl_struct {
+    my ($self,$js) = @_;
+    my $repl = $self->repl;
+    $js = "JSON.stringify( function(){ var res = $js; return { result: res }}())";
+    my $d = $self->to_perl($repl->execute($js));
+    $d->{result}
+};
+
+sub repl {$_[0]->{repl}};
+sub json {$_[0]->{json}};
+sub name {$_[0]->{repl}->repl};
+
+=head2 C<< $bridge->declare($js) >>
+
+Shortcut to declare anonymous JS functions
+that will be cached in the bridge. This
+allows you to use anonymous functions
+in an efficient manner from your modules
+while keeping the serialization features
+of MozRepl::RemoteObject:
+
+  my $js = <<'JS';
+    function(a,b) {
+        return a+b
+    }
+  JS
+  my $fn = $self->bridge->declare($js);
+  $fn->($a,$b);
+
+The function C<$fn> will remain declared
+on the Javascript side
+until the bridge is torn down.
+
+=cut
+
+sub declare {
+    my ($self,$js) = @_;
+    $self->{functions}->{$js} ||= $self->expr($js);
+};
+
+package # hide from CPAN
+    MozRepl::RemoteObject::Instance;
+use strict;
+use Carp qw(croak cluck);
+use Scalar::Util qw(blessed refaddr);
+
+use overload '%{}' => '__as_hash',
+             '@{}' => '__as_array',
+             '&{}' => '__as_code',
+             '=='  => '__object_identity',
+             '""'  => sub { overload::StrVal $_[0] };
 
 =head1 HASH access
 
@@ -284,11 +355,6 @@ objects from Perl.
 Setting hash keys will try to set the respective property
 in the Javascript object, but always as a string value,
 numerical values are not supported.
-
-B<NOTE>: Assignment of references is not yet implemented.
-So if you try to store a MozRepl::RemoteObject into
-another MozRepl::RemoteObject, the Javascript side of things
-will likely blow up.
 
 =head1 ARRAY access
 
@@ -340,11 +406,14 @@ two methods of calling a function are equivalent:
 =cut
 
 sub AUTOLOAD {
-    my $fn = $MozRepl::RemoteObject::AUTOLOAD;
+    my $fn = $MozRepl::RemoteObject::Instance::AUTOLOAD;
     $fn =~ s/.*:://;
     my $self = shift;
     return $self->__invoke($fn,@_)
 }
+
+
+=head1 OBJECT METHODS
 
 =head2 C<< $obj->__invoke(METHOD, ARGS) >>
 
@@ -377,14 +446,14 @@ sub __invoke {
     die unless $self->__id;
     
     ($fn) = $self->__transform_arguments($fn);
-    my $rn = $repl->repl;
+    my $rn = $self->bridge->name;
     @args = $self->__transform_arguments(@args);
+    use Data::Dumper;
     local $" = ',';
     my $js = <<JS;
 $rn.callMethod($id,$fn,[@args])
 JS
-    my $data = js_call_to_perl_struct($js);
-    return $self->unwrap_json_result($data);
+    return $self->bridge->unjson($js);
 }
 
 =head2 C<< $obj->__transform_arguments(@args) >>
@@ -394,11 +463,11 @@ representations.
 
 Things that match C< /^[0-9]+$/ > get passed through.
 
-MozRepl::RemoteObject instances
+MozRepl::RemoteObject::Instance instances
 are transformed into strings that resolve to their
 Javascript counterparts.
 
-MozRepl instances get transformed into their repl name.
+MozRepl::RemoteObject instances get transformed into their repl name.
 
 Everything else gets quoted and passed along as string.
 
@@ -410,15 +479,16 @@ to get an object representing these.
 
 sub __transform_arguments {
     my $self = shift;
+    my $json = $self->bridge->json;
     map {
         if (! defined) {
             'null'
         } elsif (/^[0-9]+$/) {
             $_
         } elsif (ref and blessed $_ and $_->isa(__PACKAGE__)) {
-            sprintf "%s.getLink(%d)", $repl->repl, $_->__id
-        } elsif (ref and blessed $_ and $_->isa('MozRepl')) {
-            $_->repl
+            sprintf "%s.getLink(%d)", $self->bridge->name, $_->__id
+        } elsif (ref and blessed $_ and $_->isa('MozRepl::RemoteObject')) {
+            $_->name
         } elsif (ref) {
             $json->encode($_)
         } else {
@@ -441,6 +511,22 @@ sub __id {
     my $id = $_[0]->{id};
     bless $_[0], $class;
     $id
+};
+
+=head2 C<< $obj->bridge >>
+
+Readonly accessor for the bridge
+that connects the Javascript object to the
+Perl object.
+
+=cut
+
+sub bridge {
+    my $class = ref $_[0];
+    bless $_[0], "$class\::HashAccess";
+    my $bridge = $_[0]->{bridge};
+    bless $_[0], $class;
+    $bridge
 };
 
 =head2 C<< $obj->__release_action >>
@@ -473,12 +559,14 @@ sub DESTROY {
     ;self = null;
 JS
     };
-    my $rn = $repl->repl;
-    my $data = MozRepl::RemoteObject::js_call_to_perl_struct(<<JS);
+    if ($self->bridge) { # not always there during global destruction
+        my $rn = $self->bridge->name;
+        my $data = $self->bridge->js_call_to_perl_struct(<<JS);
 (function (repl,id) {$release_action
     repl.breakLink(id);
 })($rn,$id)
 JS
+    };
 }
 
 =head2 C<< $obj->__attr ATTRIBUTE >>
@@ -498,12 +586,11 @@ sub __attr {
     my ($self,$attr) = @_;
     die unless $self->__id;
     my $id = $self->__id;
-    my $rn = $repl->repl;
-    $attr = $json->encode($attr);
-    my $data = js_call_to_perl_struct(<<JS);
+    my $rn = $self->bridge->repl->repl;
+    $attr = $self->bridge->json->encode($attr);
+    return $self->bridge->unjson(<<JS);
 $rn.getAttr($id,$attr)
 JS
-    return $self->unwrap_json_result($data);
 }
 
 =head2 C<< $obj->__setAttr ATTRIBUTE, VALUE >>
@@ -523,10 +610,10 @@ sub __setAttr {
     my ($self,$attr,$value) = @_;
     die unless $self->__id;
     my $id = $self->__id;
-    my $rn = $repl->repl;
-    $attr = $json->encode($attr);
+    my $rn = $self->bridge->repl->repl;
+    $attr = $self->bridge->json->encode($attr);
     ($value) = $self->__transform_arguments($value);
-    my $data = MozRepl::RemoteObject::js_call_to_perl_struct(<<JS);
+    my $data = $self->bridge->js_call_to_perl_struct(<<JS);
     // __setAttr
 $rn.getLink($id)[$attr]=$value
 JS
@@ -555,13 +642,12 @@ sub __dive {
     my ($self,@path) = @_;
     die unless $self->__id;
     my $id = $self->__id;
-    my $rn = $repl->repl;
+    my $rn = $self->bridge->repl->repl;
     (my $path) = $self->__transform_arguments(\@path);
     
-    my $data = js_call_to_perl_struct(<<JS);
+    my $data = $self->bridge->unjson(<<JS);
 $rn.dive($id,$path)
 JS
-    return $self->unwrap_json_result($data);
 }
 
 =head2 C<< $obj->__keys() >>
@@ -581,7 +667,7 @@ is identical to
 sub __keys { # or rather, __properties
     my ($self,$attr) = @_;
     die unless $self;
-    my $getKeys = $self->expr(<<JS);
+    my $getKeys = $self->bridge->declare(<<'JS');
     function(obj){
         var res = [];
         for (var el in obj) {
@@ -609,9 +695,8 @@ is identical to
 sub __values { # or rather, __properties
     my ($self,$attr) = @_;
     die unless $self;
-    my $getValues = $self->expr(<<JS);
+    my $getValues = $self->bridge->declare(<<'JS');
     function(obj){
-        //var obj = repl.getLink(id);
         var res = [];
         for (var el in obj) {
             res.push(obj[el]);
@@ -635,19 +720,19 @@ on HTMLdocument nodes.
 sub __xpath {
     my ($self,$query,$ref) = @_; # $self is a HTMLdocument
     $ref ||= $self;
-    my $js = <<JS;
+    my $js = <<'JS';
     function(doc,q,ref) {
         var xres = doc.evaluate(q,ref,null,XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null );
         var res = [];
         var c = 0;
         for ( var i=0 ; i < xres.snapshotLength; i++ )
         {
-            res.push( repl.link( xres.snapshotItem(i)));
+            res.push( xres.snapshotItem(i));
         };
         return res
     }
 JS
-    my $snap = $self->expr($js);
+    my $snap = $self->bridge->declare($js);
     my $res = $snap->($self,$query,$ref);
     @{ $res }
 }
@@ -663,7 +748,7 @@ on HTMLdocument nodes or their children.
 
 sub __click {
     my ($self) = @_; # $self is a HTMLdocument or a descendant!
-    my $click = $self->expr(<<JS);
+    my $click = $self->declare(<<'JS');
     function(target) {
         var event = content.document.createEvent('MouseEvents');
         event.initMouseEvent('click', true, true, window,
@@ -675,11 +760,11 @@ JS
     $click->($self);
 }
 
-=head2 C<< MozRepl::RemoteObject->new ID, onDestroy >>
+=head2 C<< MozRepl::RemoteObject->new bridge, ID, onDestroy >>
 
 This creates a new Perl object that's linked to the
 Javascript object C<ID>. You usually do not call this
-directly but use C<< MozRepl::RemoteObject->link_ids @IDs >>
+directly but use C<< $bridge->link_ids @IDs >>
 to wrap a list of Javascript ids with Perl objects.
 
 The C<onDestroy> parameter should contain a Javascript
@@ -711,22 +796,14 @@ when your Perl program exits.
 =cut
 
 sub new {
-    my ($package,$id,$release_action) = @_;
+    my ($package,$bridge, $id,$release_action) = @_;
     my $self = {
         id => $id,
+        bridge => $bridge,
         release_action => $release_action,
     };
     bless $self, ref $package || $package;
 };
-
-sub link_ids {
-    my $package = shift;
-    map {
-        $_ ? $package->new( $_ )
-           : undef
-    } @_
-}
-
 
 sub __object_identity {
     my ($self,$other) = @_;
@@ -737,39 +814,12 @@ sub __object_identity {
     die unless $self->__id;
     my $left = $self->__id;
     my $right = $other->__id;
-    my $rn = $repl->repl;
-    my $data = MozRepl::RemoteObject::js_call_to_perl_struct(<<JS);
+    my $rn = $self->bridge->name;
+    my $data = $self->bridge->js_call_to_perl_struct(<<JS);
     // __object_identity
 $rn.getLink($left)===$rn.getLink($right)
 JS
 }
-
-=head2 C<< js_call_to_perl_struct $js, $repl >>
-
-Takes a scalar with JS code, executes it, and returns
-the result as a Perl structure.
-
-C<$repl> is optional and defaults to $MozRepl::RemoteObject::repl.
-
-This will not (yet?) cope with objects on the remote side, so you
-will need to make sure to call C<< $rn.link() >> on all objects
-that are to persist across the bridge.
-
-This is a very low level method. You are better advised to use
-C<< MozRepl::RemoteObject->expr() >> as that will know
-to properly wrap objects but leave other values alone.
-
-=cut
-
-# This should go into its own package to clean up the namespace
-sub js_call_to_perl_struct {
-    my ($js,$_repl) = @_;
-    $_repl ||= $repl;
-    $js = "JSON.stringify( function(){ var res = $js; return { result: res }}())";
-    my $d = to_perl($_repl->execute($js));
-    $d->{result}
-};
-
 
 # tied interface reflection
 
@@ -803,14 +853,13 @@ sub __as_code {
         my $id = $self->__id;
         die unless $self->__id;
         
-        my $rn = $repl->repl;
+        my $rn = $self->bridge->repl->repl;
         @args = $self->__transform_arguments(@args);
         local $" = ',';
         my $js = <<JS;
     $rn.callThis($id,[@args])
 JS
-        my $data = js_call_to_perl_struct($js);
-        return $self->unwrap_json_result($data);
+        return $self->bridge->unjson($js);
     };
 };
 
@@ -906,11 +955,13 @@ The communication with the MozRepl plugin is done
 through 7bit safe ASCII. The received bytes are supposed
 to be UTF-8, but this seems not always to be the case.
 
-Currently there is no way to specify a different encoding.
+Currently there is no way to specify a different encoding
+on the fly. You have to replace or reconfigure
+the JSON object in the constructor.
 
 You can toggle the utf8'ness by calling
 
-  $MozRepl::RemoteObject::json->utf8;
+  $bridge->json->utf8;
 
 =head1 TODO
 
@@ -918,24 +969,9 @@ You can toggle the utf8'ness by calling
 
 =item *
 
-Add configuration option through environment variable
-so the ip+port can be configured from the outside for the tests
-
-=item *
-
-Make tests C<skip_all> if MozRepl cannot connect.
-
-=item *
-
 For tests that connect to the outside world,
 check/ask whether we're allowed to. If running
 automated, skip.
-
-=item *
-
-Remove the reliance on the global C<$repl> and make
-each object carry a reference to the C<$repl> that created
-it. This will allow access to more than one C<$repl>.
 
 =item *
 
@@ -1017,18 +1053,6 @@ synchronous MozRepl implementation.
 
 =item *
 
-Create a convenience wrapper to define anonymous JS functions
-and return them as anonymous Perl subroutines.
-
-=item *
-
-Create a convenience wrapper to define anonymous Perl subroutines
-and stuff them into Javascript as anonymous Javascript functions.
-
-These would be executed by the receiving Perl side.
-
-=item *
-
 Implement fetching of more than one property at once through __attr()
 
 =item *
@@ -1044,6 +1068,14 @@ is returned (and purged) as out-of-band data with every response
 to enable more polled events.
 
 This would lead to implementing a full two-way message bus.
+
+=item *
+
+Create a convenience wrapper to define anonymous Perl subroutines
+and stuff them into Javascript as anonymous Javascript functions.
+
+These would be executed by the receiving Perl side when it
+reads the requests from the event queue.
 
 =item *
 
@@ -1065,7 +1097,8 @@ This would lead to implementing a full two-way message bus.
 
 L<Win32::OLE> for another implementation of proxy objects
 
-L<http://wiki.github.com/bard/mozrepl> - the MozRepl FireFox plugin homepage
+L<http://wiki.github.com/bard/mozrepl> - the MozRepl 
+FireFox plugin homepage
 
 =head1 REPOSITORY
 
