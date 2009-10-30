@@ -1,4 +1,8 @@
-0.03 20091028
+0.04 20091030
+    . Added exists functionality for hashes
+    . added $bridge->appinfo as a convenience function
+
+0.03 20091029
     ! Fixed ->__xpath
     ! Fixed bad use of ->declare
     * Use the stable but large encoding of 7-bit ASCII
