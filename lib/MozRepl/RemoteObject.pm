@@ -3,6 +3,7 @@ use strict;
 use JSON;
 use Carp qw(croak cluck);
 use MozRepl;
+use Scalar::Util qw(refaddr);
 
 =head1 NAME
 
@@ -38,7 +39,7 @@ MozRepl::RemoteObject - treat Javascript objects as Perl objects
 =cut
 
 use vars qw[$VERSION $objBridge];
-$VERSION = '0.04';
+$VERSION = '0.05';
 
 # This should go into __setup__ and attach itself to $repl as .link()
 $objBridge = <<JS;
@@ -56,22 +57,25 @@ repl.link = function(obj) {
     } else {
         return undefined
     }
-}
+};
+
 repl.getLink = function(id) {
     return repl.linkedVars[ id ];
-}
+};
 
 repl.breakLink = function(id) {
     delete repl.linkedVars[ id ];
-}
+};
 
 repl.getAttr = function(id,attr) {
     var v = repl.getLink(id)[attr];
     return repl.wrapResults(v)
-}
+};
 
+repl.eventQueue = [];
 repl.wrapResults = function(v) {
     // Should we return arrays as arrays instead of returning a ref to them?
+    var payload;
     if (  v instanceof String
        || typeof(v) == "string"
        || v instanceof Number
@@ -79,11 +83,21 @@ repl.wrapResults = function(v) {
        || v instanceof Boolean
        || typeof(v) == "boolean"
        ) {
-        return { result: v, type: null }
+        payload = { result: v, type: null }
     } else {
-        return { result: repl.link(v), type: typeof(v) }
+        payload = { result: repl.link(v), type: typeof(v) }
     };
-}
+    
+    if (repl.eventQueue.length) {
+        // cheap cop-out
+        payload.events = [];
+        for (var ev in repl.eventQueue) {
+            payload.events.push(repl.link(repl.eventQueue[ev]));
+        };
+        repl.eventQueue = [];
+    };
+    return payload;
+};
 
 repl.dive = function(id,elts) {
     var obj = repl.getLink(id);
@@ -99,12 +113,12 @@ repl.dive = function(id,elts) {
         };
     };
     return repl.wrapResults(obj)
-}
+};
 
 repl.callThis = function(id,args) {
     var obj = repl.getLink(id);
     return repl.wrapResults( obj.apply(obj, args));
-}
+};
 
 repl.callMethod = function(id,fn,args) { 
     var obj = repl.getLink(id);
@@ -113,6 +127,18 @@ repl.callMethod = function(id,fn,args) {
         throw "Object has no function " + fn;
     }
     return repl.wrapResults( f.apply(obj, args));
+};
+
+
+repl.makeCatchEvent = function(myid) {
+        var id = myid;
+        return function(ev) {
+            repl.eventQueue.push({
+                cbid : id,
+                ts   : Number(new Date()),
+                event: ev 
+            });
+        };
 };
 
 // This should return links to all installed functions
@@ -125,7 +151,7 @@ JS
 sub to_perl {
     my ($self,$js) = @_;
     local $_ = $js;
-    s/^(\.+\>)+//; # remove Mozrepl continuation prompts
+    s/^(\.+\>\s*)+//; # remove Mozrepl continuation prompts
     s/^"//;
     s/"$//;
     # reraise JS errors from perspective of caller
@@ -133,8 +159,9 @@ sub to_perl {
         croak "MozRepl::RemoteObject: $1";
     };
     #warn "[[$_]]";
-    s/\\x/\\\\x/g; # effin' .toSource() sends us \xHH escapes, and JSON doesn't
+    # effin' .toSource() sends us \xHH escapes, and JSON doesn't
     # know what to do with them. So I pass them through unharmed :-(
+    #s/\\x/\\\\x/g;
     $self->json->decode($_)
 };
 
@@ -142,6 +169,12 @@ sub to_perl {
 # to handle async events
 sub unwrap_json_result {
     my ($self,$data) = @_;
+    if (my $events = delete $data->{events}) {
+        my @ev = $self->link_ids( @$events );
+        for my $ev (@ev) {
+            $self->dispatch_callback($ev);
+        };
+    };
     if ($data->{type}) {
         return ($self->link_ids( $data->{result} ))[0]
     } else {
@@ -163,9 +196,6 @@ sub unjson {
 Installs the Javascript C<< <-> >> Perl bridge. If you pass in
 an existing L<MozRepl> instance, it must have L<MozRepl::Plugin::JSON2>
 loaded.
-
-By default, MozRepl::RemoteObject will set up its own MozRepl instance
-and store it in $MozRepl::RemoteObject::repl .
 
 If C<repl> is not passed in, C<$ENV{MOZREPL}> will be used
 to find the ip address and portnumber to connect to. If C<$ENV{MOZREPL}>
@@ -229,6 +259,7 @@ sub install_bridge {
     
     my $rn = $options{repl}->repl;
     $options{ json } ||= JSON->new->allow_nonref->ascii; #->utf8;
+    #$options{ json } ||= JSON->new->allow_nonref->latin1;
 
     # Load the JS side of the JS <-> Perl bridge
     for my $c ($objBridge) {
@@ -239,6 +270,7 @@ sub install_bridge {
     };
     
     $options{ functions } = {}; # cache
+    $options{ callbacks } = {}; # active callbacks
 
     bless \%options, $package
 };
@@ -411,6 +443,41 @@ sub json {$_[0]->{json}};
 sub name {$_[0]->{repl}->repl};
 sub queue {$_[0]->{queue}};
 
+sub make_callback {
+    my ($self,$cb) = @_;
+    my $cbid = refaddr $cb;
+    my $makeCatchEvent = $self->declare(<<'JS');
+    function(repl,id) {
+        return repl.makeCatchEvent(id);
+    };
+JS
+    #(my $res) = $self->link_ids($makeCatchEvent->($self,$cbid));
+    my $res = $makeCatchEvent->($self,$cbid);
+    croak "Couldn't create a callback"
+        if (! $res);
+    #warn "Got callback Javascript proxy as $res";
+    $self->{callbacks}->{$cbid} = { callback => $cb, jsproxy => $res };
+    $res
+};
+
+sub dispatch_callback {
+    my ($self,$ev) = @_;
+    my $cbid = $ev->{cbid};
+    $self->{callbacks}->{$cbid}->{callback}->($ev->{event});
+};
+
+=head2 C<< $bridge->poll >>
+
+A crude no-op that can be used to just look if new events have arrived.
+
+=cut
+
+sub poll {
+    $_[0]->expr(<<'JS');
+        1==1
+JS
+};
+
 package # hide from CPAN
     MozRepl::RemoteObject::Instance;
 use strict;
@@ -493,6 +560,39 @@ sub AUTOLOAD {
     return $self->__invoke($fn,@_)
 }
 
+=head1 EVENTS / CALLBACKS
+
+This module also implements a rudimentary asynchronous
+event dispatch mechanism. Basically, it allows you
+to write code like this and it will work:
+  
+  $window->addEventListener('load', sub { 
+       my ($event) = @_; 
+       print "I got a " . $event->{type} . " event\n";
+       print "on " . $event->{originalTarget};
+  });
+  # do other things...
+
+Note that you cannot block the execution of Javascript that way.
+The Javascript code has long continued running when you receive
+the event.
+
+Currently, only busy-waiting is implemented and there is no
+way yet for Javascript to tell Perl it has something to say.
+So in absence of a real mainloop, you have to call
+
+  $repl->poll;
+
+from time to time to look for new events. Note that I<any>
+call to Javascript will carry all events back to Perl and trigger
+the handlers there, so you only need to use poll if no other
+activity happens.
+
+
+In the long run,
+a move to L<AnyEvent> would make more sense, but currently,
+MozRepl::RemoteObject is still under heavy development on
+many fronts so that has been postponed.
 
 =head1 OBJECT METHODS
 
@@ -516,7 +616,6 @@ by this package:
     __setAttr
     __xpath
     __click
-    expr
     ...
 
 =cut
@@ -539,7 +638,7 @@ JS
 
 =head2 C<< $obj->__transform_arguments(@args) >>
 
-Transforms the passed in arguments to their string
+This method transforms the passed in arguments to their JSON string
 representations.
 
 Things that match C< /^[0-9]+$/ > get passed through.
@@ -570,6 +669,10 @@ sub __transform_arguments {
             sprintf "%s.getLink(%d)", $self->bridge->name, $_->__id
         } elsif (ref and blessed $_ and $_->isa('MozRepl::RemoteObject')) {
             $_->name
+        } elsif (ref and ref eq 'CODE') { # callback
+            my $cb = $self->bridge->make_callback($_);
+            sprintf "%s.getLink(%d)", $self->bridge->name,
+                                      $cb->__id
         } elsif (ref) {
             $json->encode($_)
         } else {
@@ -1133,18 +1236,6 @@ the C<< click() >> method is preferrable.
 
 =item *
 
-Implement "notifications":
-
-  gBrowser.addEventListener('load', function() { 
-      repl.mechanize.update_content++
-  });
-
-The notifications would be sent as the events:
-entry in any response from a queue, at least for the
-synchronous MozRepl implementation.
-
-=item *
-
 Implement fetching of more than one property at once through __attr()
 
 =item *
@@ -1152,22 +1243,6 @@ Implement fetching of more than one property at once through __attr()
 Implement automatic reblessing of JS objects into Perl objects
 based on a typemap instead of blessing everything into
 MozRepl::RemoteObject.
-
-=item *
-
-On the Javascript side, there should be an event queue which
-is returned (and purged) as out-of-band data with every response
-to enable more polled events.
-
-This would lead to implementing a full two-way message bus.
-
-=item *
-
-Create a convenience wrapper to define anonymous Perl subroutines
-and stuff them into Javascript as anonymous Javascript functions.
-
-These would be executed by the receiving Perl side when it
-reads the requests from the event queue.
 
 =item *
 
@@ -1188,14 +1263,10 @@ This would lead to implementing a full two-way message bus.
 
 =item *
 
-Potentially, C<repl.print()> on the Javascript side can trigger
-an event. This would mean that we need asynchronous IO
-between Perl and JS, and potentially L<AnyEvent>.
-
-=item *
-
 Consider implementing a mozrepl "interactor" to remove
 the prompting of C<mozrepl> alltogether.
+Interactors only exist in the development releases
+of C<mozrepl>.
 
 =item *
 
