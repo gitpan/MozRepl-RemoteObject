@@ -15,7 +15,7 @@ the MozRepl::RemoteObject JSON encoding/decoding.
 
 =cut
 
-$VERSION = '0.05';
+$VERSION = '0.06';
 
 sub setup {
     my ($self, $ctx, $args) = @_;
@@ -232,8 +232,16 @@ __setup__
 // Create a JSON object only if one does not already exist. We create the
 // methods in a closure to avoid creating global variables.
 
+if (this.JSON) {
+    if (this.JSON.mozrepl) {   // is this our own JSON implementation?
+        this.JSON = undefined; // boom
+    }
+}
+
 if (!this.JSON) {
-    this.JSON = {};
+    this.JSON = {
+        mozrepl: 1,
+    };
 }
 
 (function () {
@@ -289,6 +297,8 @@ if (!this.JSON) {
         // strip "(new String(" at the start
         res = res.replace(/^\(new String\(/,"");
         res = res.replace(/\)\)$/,"");
+        res = res.replace(/\\\\/g, "\\x5c"); // hackety hack
+        res = res.replace(/\\x/g, "\\u00");  // hackety hack
         return res // this is less space efficient, but almost works
     }
 

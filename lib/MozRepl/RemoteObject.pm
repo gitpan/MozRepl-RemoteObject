@@ -39,7 +39,7 @@ MozRepl::RemoteObject - treat Javascript objects as Perl objects
 =cut
 
 use vars qw[$VERSION $objBridge];
-$VERSION = '0.05';
+$VERSION = '0.06';
 
 # This should go into __setup__ and attach itself to $repl as .link()
 $objBridge = <<JS;
@@ -161,7 +161,7 @@ sub to_perl {
     #warn "[[$_]]";
     # effin' .toSource() sends us \xHH escapes, and JSON doesn't
     # know what to do with them. So I pass them through unharmed :-(
-    #s/\\x/\\\\x/g;
+    #s/\\x/\\u00/g; # this is not safe against \\xHH, but at the moment I don't care
     $self->json->decode($_)
 };
 
@@ -934,19 +934,68 @@ on HTMLdocument nodes or their children.
 
 sub __click {
     my ($self) = @_; # $self is a HTMLdocument or a descendant!
-    my $click = $self->bridge->declare(<<'JS');
-    function(target) {
-        var event = content.document.createEvent('MouseEvents');
-        event.initMouseEvent('click', true, true, window,
-                             0, 0, 0, 0, 0, false, false, false,
-                             false, 0, null);
+    $self->__event('click');
+}
+
+=head2 C<< $obj->__change >>
+
+Sends a Javascript C<change> event to the object.
+
+This is a convenience method that should only be called
+on HTMLdocument nodes or their children.
+
+=cut
+
+sub __change {
+    my ($self) = @_; # $self is a HTMLdocument or a descendant!
+    $self->__event('change');
+}
+
+=head2 C<< $obj->__event TYPE >>
+
+Sends a Javascript event of type C<TYPE> to the object.
+
+This is a convenience method that should only be called
+on HTMLdocument nodes or their children.
+
+=head3 Send a C<focus>, C<change> and C<blur> event to an element
+
+The following code simulates the events sent by the
+user entering a value into a field:
+
+  $elt->__event('focus');
+  $elt->{value} = 'Hello';
+  $elt->__event('change');
+  $elt->__event('blur');
+  
+=cut
+
+sub __event {
+    my ($self,$type) = @_;
+    my $fn;
+    if ($type eq 'click') {
+        $fn = $self->bridge->declare(<<'JS');
+        function(target,name) {
+            var event = content.document.createEvent('MouseEvents');
+            event.initMouseEvent(name, true, true, window,
+                                 0, 0, 0, 0, 0, false, false, false,
+                                 false, 0, null);
+            target.dispatchEvent(event);
+        }
+JS
+    } else {
+        $fn = $self->bridge->declare(<<'JS');
+        function(target,name) {
+        var event = content.document.createEvent('Events');
+        event.initEvent(name, true, true);
         target.dispatchEvent(event);
     }
 JS
-    $click->($self);
-}
+    };
+    $fn->($self,$type);
+};
 
-=head2 C<< MozRepl::RemoteObject->new bridge, ID, onDestroy >>
+=head2 C<< MozRepl::RemoteObject::Instance->new bridge, ID, onDestroy >>
 
 This creates a new Perl object that's linked to the
 Javascript object C<ID>. You usually do not call this
