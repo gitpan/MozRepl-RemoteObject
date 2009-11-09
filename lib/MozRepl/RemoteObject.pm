@@ -38,8 +38,10 @@ MozRepl::RemoteObject - treat Javascript objects as Perl objects
 
 =cut
 
-use vars qw[$VERSION $objBridge];
-$VERSION = '0.06';
+use vars qw[$VERSION $objBridge @CARP_NOT];
+$VERSION = '0.07';
+
+@CARP_NOT = qw[MozRepl::RemoteObject::Instance];
 
 # This should go into __setup__ and attach itself to $repl as .link()
 $objBridge = <<JS;
@@ -72,8 +74,7 @@ repl.getAttr = function(id,attr) {
     return repl.wrapResults(v)
 };
 
-repl.eventQueue = [];
-repl.wrapResults = function(v) {
+repl.wrapValue = function(v) {
     // Should we return arrays as arrays instead of returning a ref to them?
     var payload;
     if (  v instanceof String
@@ -87,7 +88,12 @@ repl.wrapResults = function(v) {
     } else {
         payload = { result: repl.link(v), type: typeof(v) }
     };
-    
+    return payload
+}
+
+repl.eventQueue = [];
+repl.wrapResults = function(v) {
+    var payload = repl.wrapValue(v);
     if (repl.eventQueue.length) {
         // cheap cop-out
         payload.events = [];
@@ -162,7 +168,24 @@ sub to_perl {
     # effin' .toSource() sends us \xHH escapes, and JSON doesn't
     # know what to do with them. So I pass them through unharmed :-(
     #s/\\x/\\u00/g; # this is not safe against \\xHH, but at the moment I don't care
-    $self->json->decode($_)
+    my $res;
+    local $@;
+    my $json = $self->json;
+    if (! eval {
+        $res = $json->decode($_);
+        1
+    }) {
+        my $err = $@;
+        my $offset;
+        if ($err =~ /character offset (\d+)\b/) {
+            $offset = $1
+        };
+        $offset -= 10;
+        $offset = 0 if $offset < 0;
+        warn sprintf "(Sub)string is [%s]", substr($_,$offset,20);
+        die $@
+    };
+    $res
 };
 
 # Unwrap the result, will in the future also be used
@@ -258,7 +281,7 @@ sub install_bridge {
     };
     
     my $rn = $options{repl}->repl;
-    $options{ json } ||= JSON->new->allow_nonref->ascii; #->utf8;
+    $options{ json } ||= JSON->new->allow_nonref->ascii; # We send ASCII
     #$options{ json } ||= JSON->new->allow_nonref->latin1;
 
     # Load the JS side of the JS <-> Perl bridge
@@ -483,6 +506,7 @@ package # hide from CPAN
 use strict;
 use Carp qw(croak cluck);
 use Scalar::Util qw(blessed refaddr);
+push @Carp::CARP_NOT, __PACKAGE__;
 
 use overload '%{}' => '__as_hash',
              '@{}' => '__as_array',
@@ -666,7 +690,7 @@ sub __transform_arguments {
         } elsif (/^[0-9]+$/) {
             $_
         } elsif (ref and blessed $_ and $_->isa(__PACKAGE__)) {
-            sprintf "%s.getLink(%d)", $self->bridge->name, $_->__id
+            sprintf "%s.getLink(%d)", $_->bridge->name, $_->__id
         } elsif (ref and blessed $_ and $_->isa('MozRepl::RemoteObject')) {
             $_->name
         } elsif (ref and ref eq 'CODE') { # callback
@@ -770,10 +794,11 @@ is identical to
 
 sub __attr {
     my ($self,$attr) = @_;
-    die unless $self->__id;
+    die "No id given" unless $self->__id;
     my $id = $self->__id;
     my $rn = $self->bridge->name;
-    $attr = $self->bridge->json->encode($attr);
+    my $json = $self->bridge->json;
+    $attr = $json->encode($attr);
     return $self->bridge->unjson(<<JS);
 $rn.getAttr($id,$attr)
 JS
@@ -797,7 +822,8 @@ sub __setAttr {
     die unless $self->__id;
     my $id = $self->__id;
     my $rn = $self->bridge->name;
-    $attr = $self->bridge->json->encode($attr);
+    my $json = $self->bridge->json;
+    $attr = $json->encode($attr);
     ($value) = $self->__transform_arguments($value);
     my $data = $self->bridge->js_call_to_perl_struct(<<JS);
     // __setAttr
@@ -1330,6 +1356,56 @@ Should I make room for promises as well?
 The JS could instantiate another level of proxy objects
 that would have to get filled by a batch of JS statements
 sent from Perl to fill in all those promises.
+
+  $bridge->promise( 'window' )
+  could return
+  sub { $bridge->expr('window') }
+  
+but that wouldn't allow for coalescing these promises into Javascript.
+
+=item *
+
+Create synchronous Javascript callbacks by blocking
+the current FireFox thread. This shouldn't block the
+rest of FireFox:
+
+      /**
+       * Netscape compatible WaitForDelay function.
+       * You can use it as an alternative to Thread.Sleep() in any major programming language
+       * that support it while JavaScript it self doesn't have any built-in function to do such a thing.
+       * parameters:
+       * (Number) delay in millisecond
+      */
+      function nsWaitForDelay(delay) {
+          /**
+            * Just uncomment this code if you're building an extention for Firefox.
+            * Since FF3, we'll have to ask for user permission to execute XPCOM objects.
+            */
+          // netscape.security.PrivilegeManager.enablePrivilege("UniversalXPConnect");
+           
+          // Get the current thread.
+          var thread = Components.classes["@mozilla.org/thread-manager;1"].getService(Components.interfaces.nsIThreadManager).currentThread;
+           
+          // Create an inner property to be used later as a notifier.
+          this.delayed = true;
+           
+          /* Call JavaScript setTimeout function
+            * to execute this.delayed = false
+            * after it finish.
+            */
+          setTimeout("this.delayed = false;", delay);
+           
+          /**
+            * Keep looping until this.delayed = false
+            */
+          while (this.delayed) {
+          /**
+            * This code will not freeze your browser as it's documented in here:
+            * https://developer.mozilla.org/en/Code_snippets/Threads#Waiting_for_a_background_task_to_complete
+            */
+          thread.processNextEvent(true);
+          }
+      }
 
 =back
 
