@@ -39,7 +39,7 @@ MozRepl::RemoteObject - treat Javascript objects as Perl objects
 =cut
 
 use vars qw[$VERSION $objBridge @CARP_NOT];
-$VERSION = '0.07';
+$VERSION = '0.08';
 
 @CARP_NOT = qw[MozRepl::RemoteObject::Instance];
 
@@ -138,11 +138,12 @@ repl.callMethod = function(id,fn,args) {
 
 repl.makeCatchEvent = function(myid) {
         var id = myid;
-        return function(ev) {
+        return function() {
+            var myargs = arguments;
             repl.eventQueue.push({
                 cbid : id,
                 ts   : Number(new Date()),
-                event: ev 
+                args : myargs
             });
         };
 };
@@ -474,19 +475,18 @@ sub make_callback {
         return repl.makeCatchEvent(id);
     };
 JS
-    #(my $res) = $self->link_ids($makeCatchEvent->($self,$cbid));
     my $res = $makeCatchEvent->($self,$cbid);
     croak "Couldn't create a callback"
         if (! $res);
-    #warn "Got callback Javascript proxy as $res";
     $self->{callbacks}->{$cbid} = { callback => $cb, jsproxy => $res };
     $res
 };
 
 sub dispatch_callback {
-    my ($self,$ev) = @_;
-    my $cbid = $ev->{cbid};
-    $self->{callbacks}->{$cbid}->{callback}->($ev->{event});
+    my ($self,$info) = @_;
+    my $cbid = $info->{cbid};
+    my @args = @{ $info->{args} };
+    $self->{callbacks}->{$cbid}->{callback}->(@args);
 };
 
 =head2 C<< $bridge->poll >>
@@ -757,6 +757,7 @@ sub __release_action {
 
 sub DESTROY {
     my $self = shift;
+    local $@;
     my $id = $self->__id();
     return unless $self->__id();
     my $release_action;
