@@ -39,7 +39,7 @@ MozRepl::RemoteObject - treat Javascript objects as Perl objects
 =cut
 
 use vars qw[$VERSION $objBridge @CARP_NOT];
-$VERSION = '0.12';
+$VERSION = '0.13';
 
 @CARP_NOT = (qw[MozRepl::RemoteObject::Instance
                 MozRepl::RemoteObject::TiedHash
@@ -313,16 +313,20 @@ sub install_bridge {
                 });
                 1;
             };
-            if (! $ok and $options{ launch }) {
-                require IPC::Run;
-                my $cmd = delete $options{ launch };
-                if (! ref $cmd) {
-                    $cmd = [$cmd,'-repl']
-                };
-                IPC::Run::start($cmd);
-                sleep 2; # to give the process a chance to launch
-                redo RETRY
-            };
+            if (! $ok ) {
+                if( $options{ launch }) {
+                    require IPC::Run;
+                    my $cmd = delete $options{ launch };
+                    if (! ref $cmd) {
+                        $cmd = [$cmd,'-repl']
+                    };
+                    IPC::Run::start($cmd);
+                    sleep 2; # to give the process a chance to launch
+                    redo RETRY
+                } else {
+                    die "Failed to connect to @host_port, $@";
+                }
+            }
         };
     };
     
@@ -504,10 +508,17 @@ sub js_call_to_perl_struct {
         $queued = join( "//\n;\n", @{ $self->queue }) . "//\n;\n";
         @{ $self->queue } = ();
     };
-    $js = "${queued}JSON.stringify( function(){ var res = $js; return { result: res }}())";
     #warn "<<$js>>";
-    my $d = $self->to_perl($repl->execute($js));
-    $d->{result}
+    if (defined wantarray) {
+        #warn "Returning result of $js";
+        $js = "${queued}JSON.stringify( function(){ var res = $js; return { result: res }}())";
+        my $d = $self->to_perl($repl->execute($js));
+        return $d->{result}
+    } else {
+        #warn "Executing $js";
+        $repl->execute($js);
+        ()
+    };
 };
 
 sub repl {$_[0]->{repl}};
@@ -868,13 +879,15 @@ sub DESTROY {
 JS
     };
     if ($self->bridge) { # not always there during global destruction
-        my $rn = $self->bridge->name;
-        # we don't want a result here!
-        $self->bridge->exprq(<<JS);
+        my $rn = $self->bridge->name; 
+        if ($rn) { # not always there during global destruction
+            # we don't want a result here!
+            $self->bridge->exprq(<<JS);
 (function (repl,id) {$release_action
     repl.breakLink(id);
 })($rn,$id)
 JS
+        };
         1
     };
 }
@@ -925,8 +938,7 @@ sub __setAttr {
     my $json = $self->bridge->json;
     $attr = $json->encode($attr);
     ($value) = $self->__transform_arguments($value);
-    my $data = $self->bridge->js_call_to_perl_struct(<<JS);
-    // __setAttr
+    $self->bridge->js_call_to_perl_struct(<<JS);
 $rn.getLink($id)[$attr]=$value
 JS
 }
@@ -1243,7 +1255,8 @@ sub FETCH {
 sub STORE {
     my ($tied,$k,$val) = @_;
     my $obj = $tied->{impl};
-    $obj->__setAttr($k,$val)
+    $obj->__setAttr($k,$val);
+    () # force __setAttr to return nothing
 };
 
 sub FIRSTKEY {
@@ -1298,7 +1311,8 @@ sub FETCH {
 sub STORE {
     my ($tied,$k,$val) = @_;
     my $obj = $tied->{impl};
-    $obj->__setAttr($k,$val)
+    $obj->__setAttr($k,$val);
+    (); # force void context on __setAttr
 };
 
 sub PUSH {
