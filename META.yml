@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               MozRepl-RemoteObject
-version:            0.13
+version:            0.14
 abstract:           treat Javascript objects as Perl objects
 author:
     - Max Maischein <corion@cpan.org>
