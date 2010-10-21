@@ -39,7 +39,7 @@ MozRepl::RemoteObject - treat Javascript objects as Perl objects
 =cut
 
 use vars qw[$VERSION $objBridge @CARP_NOT];
-$VERSION = '0.14';
+$VERSION = '0.15';
 
 @CARP_NOT = (qw[MozRepl::RemoteObject::Instance
                 MozRepl::RemoteObject::TiedHash
@@ -994,7 +994,9 @@ sub __keys { # or rather, __properties
     function(obj){
         var res = [];
         for (var el in obj) {
-            res.push(el);
+            if (obj.hasOwnProperty(el)) {
+                res.push(el);
+            };
         }
         return res
     }
@@ -1277,10 +1279,19 @@ sub EXISTS {
     my $obj = $tied->{impl};
     my $exists = $obj->bridge->declare(<<'JS');
     function(elt,prop) {
-        return prop in elt
+        return (prop in elt && elt.hasOwnProperty(prop))
     }
 JS
     $exists->($obj,$key);
+}
+
+sub DELETE {
+    my ($tied,$key) = @_;
+    my $obj = $tied->{impl};
+    my $delete = $obj->bridge->declare(<<'JS');
+    function(elt,prop) {delete elt[prop]}
+JS
+    $delete->($obj,$key);
 }
 
 1;
