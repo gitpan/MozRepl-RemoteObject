@@ -39,7 +39,7 @@ MozRepl::RemoteObject - treat Javascript objects as Perl objects
 =cut
 
 use vars qw[$VERSION $objBridge @CARP_NOT];
-$VERSION = '0.16';
+$VERSION = '0.17';
 
 @CARP_NOT = (qw[MozRepl::RemoteObject::Instance
                 MozRepl::RemoteObject::TiedHash
@@ -238,6 +238,25 @@ If C<repl> is not a reference, it will be used instead of C<$ENV{MOZREPL}>.
 To replace the default JSON parser, you can pass it in using the C<json>
 option.
 
+=over 4
+
+=item *
+
+C<repl> - a premade L<MozRepl> instance to use, or alternatively a
+connection string to use
+
+C<use_queue> - whether to queue destructors until the next command. This
+reduces the latency and amount of queries sent via L<MozRepl> by half,
+at the cost of a bit delayed release of objects on the remote side. The
+release commands get queued until the next "real" command gets sent
+through L<MozRepl>.
+
+=item *
+
+C<launch> - the command line to launch the program that runs C<mozrepl>.
+
+=back
+
 =head3 Connect to a different machine
 
 If you want to connect to a Firefox instance on a different machine,
@@ -371,6 +390,7 @@ sub expr_js {
     my ($self,$js) = @_;
     $js = $self->json->encode($js);
     my $rn = $self->name;
+    return '' unless $rn; # If we have no repl (name), we can't do anything anyway
 #warn "($rn)";
     $js = <<JS;
     (function(repl,code) {
@@ -415,12 +435,20 @@ sub queued {
     $cb->();
     # ideally, we would gather the results here and
     # also return those, if wanted.
-    if (! $self->{use_queue}--) {
+    if (--$self->{use_queue} == 0) {
         # flush the queue
-        my $js = join "//\n;//\n", @{ $self->queue };
+        #my $js = join "//\n;//\n", @{ $self->queue };
+        my $js = join "\n", map { /;$/? $_ : "$_;" } @{ $self->queue };
         # we don't want a result here!
         $self->repl->execute($js);
         @{ $self->queue } = ();
+    };
+};
+
+sub DESTROY {
+    my ($self) = @_;
+    if ($self->{use_queue} and $self->queue and @{ $self->queue }) {
+        $self->poll;
     };
 };
 
@@ -513,7 +541,9 @@ sub js_call_to_perl_struct {
     };
     my $queued = '';
     if (@{ $self->queue }) {
-        $queued = join( "//\n;\n", @{ $self->queue }) . "//\n;\n";
+        # This should become ->flush_queue()
+        $queued = join "\n", map { /;$/? $_ : "$_;" } @{ $self->queue };
+        #$queued = join( ";", @{ $self->queue }) . ";\n";
         @{ $self->queue } = ();
     };
     #warn "<<$js>>";
@@ -582,9 +612,7 @@ A crude no-op that can be used to just look if new events have arrived.
 =cut
 
 sub poll {
-    $_[0]->expr(<<'JS');
-        1==1
-JS
+    $_[0]->expr('1==1');
 };
 
 package # hide from CPAN
@@ -867,20 +895,23 @@ sub DESTROY {
     return unless $self->__id();
     my $release_action;
     if ($release_action = ($self->__release_action || '')) {
-        $release_action = <<JS;
-    var self = repl.getLink(id);
-        $release_action //
-    ;self = null;
-JS
+        $release_action =~ s/\s+$//mg;
+        $release_action = join '', 
+            'var self = repl.getLink(id);',
+            $release_action,
+            ';self = null;',
+        ;
+    };
+    if (my $on_destroy = $self->__on_destroy) {
+        #warn "Calling on_destroy";
+        $on_destroy->($self);
     };
     if ($self->bridge) { # not always there during global destruction
         my $rn = $self->bridge->name; 
         if ($rn) { # not always there during global destruction
             # we don't want a result here!
             $self->bridge->exprq(<<JS);
-(function (repl,id) {$release_action
-    repl.breakLink(id);
-})($rn,$id)
+(function(repl,id){${release_action}repl.breakLink(id)})($rn,$id)
 JS
         };
         1
