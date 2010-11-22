@@ -38,8 +38,11 @@ MozRepl::RemoteObject - treat Javascript objects as Perl objects
 
 =cut
 
-use vars qw[$VERSION $objBridge @CARP_NOT];
-$VERSION = '0.17';
+use vars qw[$VERSION $objBridge @CARP_NOT @EXPORT_OK @ISA];
+$VERSION = '0.18';
+
+@ISA='Exporter';
+@EXPORT_OK=qw[as_list];
 
 @CARP_NOT = (qw[MozRepl::RemoteObject::Instance
                 MozRepl::RemoteObject::TiedHash
@@ -82,26 +85,33 @@ repl.getAttr = function(id,attr) {
     return repl.wrapResults(v)
 };
 
-repl.wrapValue = function(v) {
-    // Should we return arrays as arrays instead of returning a ref to them?
+repl.wrapValue = function(v,context) {
     var payload;
-    if (  v instanceof String
+    if (context == "list") {
+        // The caller wants a lists instead of an array ref
+        // alert("Returning list " + v.length);
+        var r = [];
+        for (var i=0;i<v.length;i++){
+            r.push(repl.wrapValue(v[i]));
+        };
+        payload = { "result":r, "type":"list" };
+    } else if (v instanceof String
        || typeof(v) == "string"
        || v instanceof Number
        || typeof(v) == "number"
        || v instanceof Boolean
        || typeof(v) == "boolean"
        ) {
-        payload = { result: v, type: null }
+        payload = {"result":v, "type": null }
     } else {
-        payload = { result: repl.link(v), type: typeof(v) }
+        payload = {"result":repl.link(v),"type": typeof(v) }
     };
     return payload
 }
 
 repl.eventQueue = [];
-repl.wrapResults = function(v) {
-    var payload = repl.wrapValue(v);
+repl.wrapResults = function(v,context) {
+    var payload = repl.wrapValue(v,context);
     if (repl.eventQueue.length) {
         // cheap cop-out
         payload.events = [];
@@ -129,18 +139,18 @@ repl.dive = function(id,elts) {
     return repl.wrapResults(obj)
 };
 
-repl.callThis = function(id,args) {
+repl.callThis = function(id,args,context) {
     var obj = repl.getLink(id);
-    return repl.wrapResults( obj.apply(obj, args));
+    return repl.wrapResults(obj.apply(obj, args),context);
 };
 
-repl.callMethod = function(id,fn,args) { 
+repl.callMethod = function(id,fn,args,context) { 
     var obj = repl.getLink(id);
     var f = obj[fn];
     if (! f) {
         throw "Object has no function " + fn;
     }
-    return repl.wrapResults( f.apply(obj, args));
+    return repl.wrapResults(f.apply(obj, args),context);
 };
 
 
@@ -207,7 +217,14 @@ sub unwrap_json_result {
             $self->dispatch_callback($ev);
         };
     };
-    if ($data->{type}) {
+    my $t = $data->{type} || '';
+    if ($t eq 'list') {
+        return map {
+            $_->{type}
+            ? $self->link_ids( $_->{result} )
+            : $_->{result}
+        } @{ $data->{result} };
+    } elsif ($data->{type}) {
         return ($self->link_ids( $data->{result} ))[0]
     } else {
         return $data->{result}
@@ -244,6 +261,8 @@ option.
 
 C<repl> - a premade L<MozRepl> instance to use, or alternatively a
 connection string to use
+
+=item *
 
 C<use_queue> - whether to queue destructors until the next command. This
 reduces the latency and amount of queries sent via L<MozRepl> by half,
@@ -365,7 +384,7 @@ sub install_bridge {
     bless \%options, $package
 };
 
-=head2 C<< $bridge->expr $js >>
+=head2 C<< $bridge->expr( $js, $context ) >>
 
 Runs the Javascript passed in through C< $js > and links
 the returned result to a Perl object or a plain
@@ -384,25 +403,36 @@ You can also create Javascript functions and use them from Perl:
   JS
   print $add->(2,3);
 
+The C<context> parameter allows you to specify that you
+expect a Javascript array and want it to be returned
+as list. To do that, specify C<'list'> as the C<$context> parameter:
+
+  for ($bridge->expr(<<JS,'list')) { print $_ };
+      [1,2,3,4]
+  JS
+
 =cut
 
 sub expr_js {
-    my ($self,$js) = @_;
+    my ($self,$js,$context) = @_;
     $js = $self->json->encode($js);
     my $rn = $self->name;
     return '' unless $rn; # If we have no repl (name), we can't do anything anyway
+    if ($context) { $context=qq{,"$context"}} else {
+        $context='';
+    };
 #warn "($rn)";
     $js = <<JS;
     (function(repl,code) {
-        return repl.wrapResults(eval(code))
+        return repl.wrapResults(eval(code)$context)
     })($rn,$js)
 JS
 }
 
 # This is used by ->declare() so can't use it itself
 sub expr {
-    my ($self,$js) = @_;
-    return $self->unjson($self->expr_js($js));
+    my ($self,$js,$context) = @_;
+    return $self->unjson($self->expr_js($js,$context));
 }
 
 # the queue stuff is left undocumented because it's
@@ -425,6 +455,31 @@ sub exprq {
         # but we're not really interested in the result
     };
 }
+
+=head2 C<< as_list( $array ) >>
+
+    for $_ in (as_list $array) {
+        print $_->{innerHTML},"\n";
+    };
+
+Efficiently fetches all elements from C< @$array >. This is
+functionally equivalent to writing
+
+    @$array
+
+except that it involves much less roundtrips between Javascript
+and Perl.
+
+=cut
+
+sub as_list {
+    my ($array) = @_;
+    my $repl = $array->bridge;
+    my $as_array = $repl->declare(<<'JS','list');
+        function(a){return a}
+JS
+    $as_array->($array)
+};
 
 sub queued {
     my ($self,$cb) = @_;
@@ -452,7 +507,7 @@ sub DESTROY {
     };
 };
 
-=head2 C<< $bridge->declare($js) >>
+=head2 C<< $bridge->declare( $js, $context ) >>
 
 Shortcut to declare anonymous JS functions
 that will be cached in the bridge. This
@@ -473,10 +528,13 @@ The function C<$fn> will remain declared
 on the Javascript side
 until the bridge is torn down.
 
+If you expect an array to be returned and want the array
+to be fetched as list, pass C<'list'> as the C<$context>.
+
 =cut
 
 sub declare {
-    my ($self,$js) = @_;
+    my ($self,$js,$context) = @_;
     if (! $self->{functions}->{$js}) {
         $self->{functions}->{$js} = $self->expr($js);
         # Weaken the backlink of the function
@@ -484,6 +542,7 @@ sub declare {
         my $ref = ref $res;
         bless $res, "$ref\::HashAccess";
         weaken $res->{bridge};
+        $res->{return_context} = $context;
         bless $res => $ref;
     };
     $self->{functions}->{$js}
@@ -918,7 +977,7 @@ JS
     };
 }
 
-=head2 C<< $obj->__attr ATTRIBUTE >>
+=head2 C<< $obj->__attr( $attribute ) >>
 
 Read-only accessor to read the property
 of a Javascript object.
@@ -943,7 +1002,7 @@ $rn.getAttr($id,$attr)
 JS
 }
 
-=head2 C<< $obj->__setAttr ATTRIBUTE, VALUE >>
+=head2 C<< $obj->__setAttr( $attribute, $value ) >>
 
 Write accessor to set a property of a Javascript
 object.
@@ -969,7 +1028,7 @@ $rn.getLink($id)[$attr]=$value
 JS
 }
 
-=head2 C<< $obj->__dive @PATH >>
+=head2 C<< $obj->__dive( @PATH ) >>
 
 Convenience method to quickly dive down a property chain.
 
@@ -1017,7 +1076,7 @@ is identical to
 sub __keys { # or rather, __properties
     my ($self,$attr) = @_;
     die unless $self;
-    my $getKeys = $self->bridge->declare(<<'JS');
+    my $getKeys = $self->bridge->declare(<<'JS', 'list');
     function(obj){
         var res = [];
         for (var el in obj) {
@@ -1028,10 +1087,10 @@ sub __keys { # or rather, __properties
         return res
     }
 JS
-    return @{ $getKeys->($self) };
+    return $getKeys->($self)
 }
 
-=head2 C<< $obj->__values >>
+=head2 C<< $obj->__values() >>
 
 Returns the values of all properties
 as a list.
@@ -1047,7 +1106,7 @@ is identical to
 sub __values { # or rather, __properties
     my ($self,$attr) = @_;
     die unless $self;
-    my $getValues = $self->bridge->declare(<<'JS');
+    my $getValues = $self->bridge->declare(<<'JS','list');
     function(obj){
         var res = [];
         for (var el in obj) {
@@ -1056,10 +1115,10 @@ sub __values { # or rather, __properties
         return res
     }
 JS
-    return @{ $getValues->($self) };
+    return $getValues->($self);
 }
 
-=head2 C<< $obj->__xpath QUERY [, REF] >>
+=head2 C<< $obj->__xpath( $query [, $ref ] ) >>
 
 Executes an XPath query and returns the node
 snapshot result as a list.
@@ -1076,7 +1135,6 @@ sub __xpath {
     function(doc,q,ref) {
         var xres = doc.evaluate(q,ref,null,XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null );
         var res = [];
-        var c = 0;
         for ( var i=0 ; i < xres.snapshotLength; i++ )
         {
             res.push( xres.snapshotItem(i));
@@ -1084,9 +1142,8 @@ sub __xpath {
         return res
     }
 JS
-    my $snap = $self->bridge->declare($js);
-    my $res = $snap->($self,$query,$ref);
-    @{ $res }
+    my $snap = $self->bridge->declare($js,'list');
+    $snap->($self,$query,$ref);
 }
 
 =head2 C<< $obj->__click >>
@@ -1161,7 +1218,7 @@ JS
     $fn->($self,$type);
 };
 
-=head2 C<< MozRepl::RemoteObject::Instance->new bridge, ID, onDestroy >>
+=head2 C<< MozRepl::RemoteObject::Instance->new( $bridge, $ID, $onDestroy ) >>
 
 This creates a new Perl object that's linked to the
 Javascript object C<ID>. You usually do not call this
@@ -1224,11 +1281,11 @@ JS
 
 # tied interface reflection
 
-=head2 C<< $obj->__as_hash >>
+=head2 C<< $obj->__as_hash() >>
 
-=head2 C<< $obj->__as_array >>
+=head2 C<< $obj->__as_array() >>
 
-=head2 C<< $obj->__as_code >>
+=head2 C<< $obj->__as_code() >>
 
 Returns a reference to a hash/array/coderef. This is used
 by L<overload>. Don't use these directly.
@@ -1249,16 +1306,21 @@ sub __as_array {
 
 sub __as_code {
     my $self = shift;
+    my $class = ref $self;
+    bless $self, "$class\::HashAccess";
+    my $id = $self->{id};
+    my $context = $self->{ return_context }
+                ? qq{,"$self->{ return_context }"}
+                : '';
+    bless $self, $class;
     return sub {
         my (@args) = @_;
-        my $id = $self->__id;
-        die unless $self->__id;
         
         my $rn = $self->bridge->name;
         @args = $self->__transform_arguments(@args);
         local $" = ',';
         my $js = <<JS;
-    $rn.callThis($id,[@args])
+    $rn.callThis($id,[@args]$context)
 JS
         return $self->bridge->unjson($js);
     };
@@ -1316,7 +1378,11 @@ sub DELETE {
     my ($tied,$key) = @_;
     my $obj = $tied->{impl};
     my $delete = $obj->bridge->declare(<<'JS');
-    function(elt,prop) {delete elt[prop]}
+    function(elt,prop) {
+        var r=elt[prop];
+        delete elt[prop];
+        return r
+    }
 JS
     $delete->($obj,$key);
 }
@@ -1363,9 +1429,26 @@ sub PUSH {
 sub POP {
     my $tied = shift;
     my $obj = $tied->{impl};
-    for (@_) {
-        $obj->pop($_);
-    };
+    $obj->pop();
+};
+
+sub SPLICE {
+    my ($tied,$from,$count) = (shift,shift,shift);
+    my $obj = $tied->{impl};
+    $from ||= 0;
+    $count ||= $obj->{length};
+    MozRepl::RemoteObject::as_list $obj->splice($from,$count,@_);
+};
+
+sub CLEAR {
+    my $tied = shift;
+    my $obj = $tied->{impl};
+    $obj->splice(0,$obj->{length});
+    ()
+};
+
+sub EXTEND {
+    # we acknowledge the advice
 };
 
 1;
@@ -1420,21 +1503,6 @@ respective JS object type?
 
 =item *
 
-Create a lazy object release mechanism that adds object releases
-to a queue and only sends them when either $repl goes out
-of scope or another request (for a property etc.) is sent.
-
-This would reduce the TCP latency when manually descending
-through an object tree in a Perl-side loop.
-
-This might introduce interesting problems when objects
-get delayed until global destruction begins and the MozRepl
-gets shut down before all object destructions could be sent.
-
-This is an optimization and hence gets postponed.
-
-=item *
-
 Add truely lazy objects that don't allocate their JS counterparts
 until an C<< __attr() >> is requested or a method call is made.
 
@@ -1468,7 +1536,7 @@ Implement fetching of more than one property at once through __attr()
 
 Implement automatic reblessing of JS objects into Perl objects
 based on a typemap instead of blessing everything into
-MozRepl::RemoteObject.
+MozRepl::RemoteObject::Instance.
 
 =item *
 
