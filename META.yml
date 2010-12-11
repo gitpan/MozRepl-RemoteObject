@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               MozRepl-RemoteObject
-version:            0.18
+version:            0.19
 abstract:           treat Javascript objects as Perl objects
 author:
     - Max Maischein <corion@cpan.org>
@@ -12,12 +12,17 @@ build_requires:
     ExtUtils::MakeMaker:  0
 requires:
     Encode:          0
+    Exporter:        0
     File::Basename:  0
     IPC::Run:        0
     JSON:            2
     MozRepl:         0.06
     parent:          0
+    perl:            5.006
     Scalar::Util:    0
+    Task::Weaken:    0
+resources:
+    repository:  http://github.com/Corion/mozrepl-remoteobject
 no_index:
     directory:
         - t

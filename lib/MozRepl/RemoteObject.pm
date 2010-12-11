@@ -1,5 +1,6 @@
 package MozRepl::RemoteObject;
 use strict;
+use Exporter 'import';
 use JSON;
 use Carp qw(croak cluck);
 use MozRepl;
@@ -38,12 +39,10 @@ MozRepl::RemoteObject - treat Javascript objects as Perl objects
 
 =cut
 
-use vars qw[$VERSION $objBridge @CARP_NOT @EXPORT_OK @ISA];
-$VERSION = '0.18';
+use vars qw[$VERSION $objBridge @CARP_NOT @EXPORT_OK $WARN_ON_LEAKS];
+$VERSION = '0.19';
 
-@ISA='Exporter';
 @EXPORT_OK=qw[as_list];
-
 @CARP_NOT = (qw[MozRepl::RemoteObject::Instance
                 MozRepl::RemoteObject::TiedHash
                 MozRepl::RemoteObject::TiedArray
@@ -176,6 +175,7 @@ JS
 sub to_perl {
     my ($self,$js) = @_;
     local $_ = $js;
+    #warn $js;
     s/^(\.+\>\s*)+//; # remove Mozrepl continuation prompts
     s/^"//;
     s/"$//;
@@ -322,6 +322,7 @@ C<launch> option:
 sub install_bridge {
     my ($package, %options) = @_;
     $options{ repl } ||= $ENV{MOZREPL};
+    $options{ constants } ||= {};
     $options{ log } ||= [qw/ error/];
     $options{ queue } ||= [];
     $options{ use_queue } ||= 0; # > 0 means enqueue
@@ -379,9 +380,10 @@ sub install_bridge {
     $options{repl}->execute($c);
     
     $options{ functions } = {}; # cache
+    $options{ constants } = {}; # cache
     $options{ callbacks } = {}; # active callbacks
 
-    bless \%options, $package
+    bless \%options, $package;    
 };
 
 =head2 C<< $bridge->expr( $js, $context ) >>
@@ -502,9 +504,12 @@ sub queued {
 
 sub DESTROY {
     my ($self) = @_;
+    #warn "Repl cleaning up";
+    delete @{$self}{ qw( constants functions callbacks )};
     if ($self->{use_queue} and $self->queue and @{ $self->queue }) {
         $self->poll;
     };
+    #warn "Repl cleaned up";
 };
 
 =head2 C<< $bridge->declare( $js, $context ) >>
@@ -556,6 +561,33 @@ sub link_ids {
     } @_
 }
 
+=head2 C<< $bridge->constant( $NAME ) >>
+
+    my $i = $bridge->constant( 'Components.interfaces.nsIWebProgressListener.STATE_STOP' );
+
+Fetches and caches a Javascript constant. If you use this to fetch
+and cache Javascript objects, this will create memory leaks, as these objects
+will not get released.
+
+=cut
+
+sub constant {
+    my ($self, $name) = @_;
+    if (! exists $self->{constants}->{$name}) {
+        $self->{constants}->{$name} = $self->expr($name);
+        if (ref $self->{constants}->{$name}) {
+            #warn "*** $name is an object.";
+            # Need to weaken the backlink of the constant-object
+            my $res = $self->{constants}->{$name};
+            my $ref = ref $res;
+            bless $res, "$ref\::HashAccess";
+            weaken $res->{bridge};
+            bless $res => $ref;
+        };
+    };
+    $self->{constants}->{ $name }
+};
+
 =head2 C<< $bridge->appinfo() >>
 
 Returns the C<nsIXULAppInfo> object
@@ -601,8 +633,7 @@ sub js_call_to_perl_struct {
     my $queued = '';
     if (@{ $self->queue }) {
         # This should become ->flush_queue()
-        $queued = join "\n", map { /;$/? $_ : "$_;" } @{ $self->queue };
-        #$queued = join( ";", @{ $self->queue }) . ";\n";
+        $queued = join "\n", map { /;$/? $_ : "$_;" } map { s/\s*$//; $_ } @{ $self->queue };
         @{ $self->queue } = ();
     };
     #warn "<<$js>>";
@@ -634,6 +665,13 @@ JS
     my $res = $makeCatchEvent->($self,$cbid);
     croak "Couldn't create a callback"
         if (! $res);
+
+    # Need to weaken the backlink of the constant-object
+    my $ref = ref $res;
+    bless $res, "$ref\::HashAccess";
+    weaken $res->{bridge};
+    bless $res => $ref;
+    
     $self->{callbacks}->{$cbid} = { callback => $cb, jsproxy => $res };
     $res
 };
@@ -641,11 +679,20 @@ JS
 sub dispatch_callback {
     my ($self,$info) = @_;
     my $cbid = $info->{cbid};
+    if (! $cbid) {
+        croak "Unknown callback fired with values @{ $info->{ args }}";
+    };
     my @args = @{ $info->{args} };
     $self->{callbacks}->{$cbid}->{callback}->(@args);
 };
 
-=head2 C<< $bridge->remove_callback $callback >>
+=head2 C<< $bridge->remove_callback( $callback ) >>
+
+    my $onload = sub {
+        ...
+    };
+    $js_object->{ onload } = $onload;
+    $bridge->remove_callback( $onload )
 
 If you want to remove a callback that you instated,
 this is the way.
@@ -972,8 +1019,14 @@ sub DESTROY {
             $self->bridge->exprq(<<JS);
 (function(repl,id){${release_action}repl.breakLink(id)})($rn,$id)
 JS
+        } else {
+        #    warn "Repl '$rn' has gone away already";
         };
         1
+    } else {
+        if ($MozRepl::RemoteObject::WARN_ON_LEAKS) {
+            warn "Can't release JS part of object $self / $id ($release_action)";
+        };
     };
 }
 
@@ -1255,6 +1308,7 @@ when your Perl program exits.
 
 sub new {
     my ($package,$bridge, $id,$release_action) = @_;
+    #warn "Created object $id";
     my $self = {
         id => $id,
         bridge => $bridge,

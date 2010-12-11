@@ -7,6 +7,7 @@ MANIFEST			This list of files
 MANIFEST.skip
 t/01-array.t
 t/01-callback.t
+t/01-constant.t
 t/01-dive.t
 t/01-expr.t
 t/01-hash.t
@@ -21,6 +22,9 @@ t/03-unicode.t
 t/04-appversion.t
 t/10-xul-hud.t
 t/10-xul-hud.xul
+t/11-memleak-callback.t
+t/11-memleak-constant.t
+t/11-memleak-declare.t
 t/11-memleak.t
 t/99-changes.t
 t/99-manifest.t
