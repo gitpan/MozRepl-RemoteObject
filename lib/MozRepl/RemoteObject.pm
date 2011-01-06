@@ -40,7 +40,7 @@ MozRepl::RemoteObject - treat Javascript objects as Perl objects
 =cut
 
 use vars qw[$VERSION $objBridge @CARP_NOT @EXPORT_OK $WARN_ON_LEAKS];
-$VERSION = '0.19';
+$VERSION = '0.20';
 
 @EXPORT_OK=qw[as_list];
 @CARP_NOT = (qw[MozRepl::RemoteObject::Instance
@@ -70,8 +70,11 @@ repl.getLink = function(id) {
     return repl.linkedVars[ id ];
 };
 
-repl.breakLink = function(id) {
-    delete repl.linkedVars[ id ];
+repl.breakLink = function() {
+    var l = arguments.length;
+    for(i=0;i<l;i++) {
+        delete repl.linkedVars[ arguments[i] ];
+    };
 };
 
 repl.purgeLinks = function() {
@@ -108,16 +111,12 @@ repl.wrapValue = function(v,context) {
     return payload
 }
 
-repl.eventQueue = [];
+var eventQueue = [];
 repl.wrapResults = function(v,context) {
     var payload = repl.wrapValue(v,context);
-    if (repl.eventQueue.length) {
-        // cheap cop-out
-        payload.events = [];
-        for (var ev in repl.eventQueue) {
-            payload.events.push(repl.link(repl.eventQueue[ev]));
-        };
-        repl.eventQueue = [];
+    if (eventQueue.length) {
+        payload.events = eventQueue;
+        eventQueue = [];
     };
     return payload;
 };
@@ -157,10 +156,10 @@ repl.makeCatchEvent = function(myid) {
         var id = myid;
         return function() {
             var myargs = arguments;
-            repl.eventQueue.push({
+            eventQueue.push({
                 cbid : id,
                 ts   : Number(new Date()),
-                args : myargs
+                args : repl.link(myargs)
             });
         };
 };
@@ -175,14 +174,26 @@ JS
 sub to_perl {
     my ($self,$js) = @_;
     local $_ = $js;
-    #warn $js;
-    s/^(\.+\>\s*)+//; # remove Mozrepl continuation prompts
+    #s/^(\.+\>\s*)+//; # remove Mozrepl continuation prompts
     s/^"//;
     s/"$//;
+    
+    if (/\.+>/) {
+        warn "Continuation prompt found in [$_]";
+    }
+    
+    #warn $js;
     # reraise JS errors from perspective of caller
     if (/^!!!\s+(.*)$/m) {
         croak "MozRepl::RemoteObject: $1";
     };
+    
+    if (! /\S/) {
+        # We got an empty string back from the REPL ...
+        warn "Got empty string from REPL";
+        return;
+    }
+    $js = $_;
     #warn "[[$_]]";
     # effin' .toSource() sends us \xHH escapes, and JSON doesn't
     # know what to do with them. So I pass them through unharmed :-(
@@ -191,7 +202,7 @@ sub to_perl {
     local $@;
     my $json = $self->json;
     if (! eval {
-        $res = $json->decode($_);
+        $res = $json->decode($js);
         1
     }) {
         my $err = $@;
@@ -201,7 +212,7 @@ sub to_perl {
         };
         $offset -= 10;
         $offset = 0 if $offset < 0;
-        warn sprintf "(Sub)string is [%s]", substr($_,$offset,20);
+        warn sprintf "(Sub)string is [%s]", substr($js,$offset,20);
         die $@
     };
     $res
@@ -212,8 +223,10 @@ sub to_perl {
 sub unwrap_json_result {
     my ($self,$data) = @_;
     if (my $events = delete $data->{events}) {
-        my @ev = $self->link_ids( @$events );
+        my @ev = @$events;
         for my $ev (@ev) {
+            $self->{stats}->{callback}++;
+            ($ev->{args}) = $self->link_ids($ev->{args});
             $self->dispatch_callback($ev);
         };
     };
@@ -326,6 +339,8 @@ sub install_bridge {
     $options{ log } ||= [qw/ error/];
     $options{ queue } ||= [];
     $options{ use_queue } ||= 0; # > 0 means enqueue
+    $options{ max_queue_size } ||= 5000; # mozrepl
+                                         # / Net::Telnet don't like too large commands
 
     if (! ref $options{repl}) { # we have host:port
         my @host_port;
@@ -452,6 +467,10 @@ sub exprq {
         # just in case we need it?
         # later
         push @{ $self->{queue} }, $js;
+        if (@{ $self->{queue} } > $self->{ max_queue_size }) {
+            # flush queue
+            $self->poll;
+        };
     } else {
         $self->js_call_to_perl_struct($js);
         # but we're not really interested in the result
@@ -625,22 +644,40 @@ to properly wrap objects but leave other values alone.
 
 sub js_call_to_perl_struct {
     my ($self,$js) = @_;
+    $self->{stats}->{roundtrip}++;
     my $repl = $self->repl;
     if (! $repl) {
         # Likely during global destruction
         return
     };
-    my $queued = '';
+    my $queue_pre = '';
+    my $queue_post = '';
     if (@{ $self->queue }) {
         # This should become ->flush_queue()
-        $queued = join "\n", map { /;$/? $_ : "$_;" } map { s/\s*$//; $_ } @{ $self->queue };
+        # Wrap all queued commands in a function,
+        # together with the payload command, so we only get one result
+        $queue_pre = join '',
+                     "(function(){",
+                     map( { /;$/? $_ : "$_;" } map { s/\s*$//; $_ } @{ $self->queue }),
+                     "return ";
+        $queue_post = "})()";
+        
         @{ $self->queue } = ();
     };
     #warn "<<$js>>";
     if (defined wantarray) {
         #warn "Returning result of $js";
-        $js = "${queued}JSON.stringify( function(){ var res = $js; return { result: res }}())";
-        my $d = $self->to_perl($repl->execute($js));
+        $js = "${queue_pre}JSON.stringify( function(){ var res = $js; return { result: res }}())$queue_post";
+        #warn $js;
+        my $res = $repl->execute($js);
+        $res =~ s/^(?:\.+\>\s+)+//g;
+        while ($res !~ /\S/) {
+            # Gobble up continuation prompts
+            warn "No result yet from repl";
+            $res = $repl->execute(";\n");
+            $res =~ s/^(?:\.+\>\s+)+//g;
+        };
+        my $d = $self->to_perl($res);
         return $d->{result}
     } else {
         #warn "Executing $js";
@@ -672,7 +709,9 @@ JS
     weaken $res->{bridge};
     bless $res => $ref;
     
-    $self->{callbacks}->{$cbid} = { callback => $cb, jsproxy => $res };
+    $self->{callbacks}->{$cbid} = {
+        callback => $cb, jsproxy => $res, where => [caller(1)],
+    };
     $res
 };
 
@@ -682,8 +721,13 @@ sub dispatch_callback {
     if (! $cbid) {
         croak "Unknown callback fired with values @{ $info->{ args }}";
     };
-    my @args = @{ $info->{args} };
-    $self->{callbacks}->{$cbid}->{callback}->(@args);
+    if (exists $self->{callbacks}->{$cbid} and my $cb = $self->{callbacks}->{$cbid}->{callback}) {
+        # Replace with goto &$cb ?
+        my @args = as_list $info->{args};
+        $cb->(@args);
+    } else {
+        warn "Unknown callback id $cbid (created in @{$self->{removed_callbacks}->{$cbid}->{where}})";
+    }
 };
 
 =head2 C<< $bridge->remove_callback( $callback ) >>
@@ -706,7 +750,8 @@ sub remove_callback {
     my ($self,@callbacks) = @_;
     for my $cb (@callbacks) {
         my $cbid = refaddr $cb;
-        delete $self->{callbacks}->{$cbid}
+        $self->{removed_callbacks}->{$cbid} = $self->{callbacks}->{$cbid}->{where};
+        delete $self->{callbacks}->{$cbid};
         # and if you don't have memory cycles, all will be fine
     };
 };
@@ -1046,6 +1091,7 @@ is identical to
 sub __attr {
     my ($self,$attr) = @_;
     die "No id given" unless $self->__id;
+    $self->bridge->{stats}->{fetch}++;
     my $id = $self->__id;
     my $rn = $self->bridge->name;
     my $json = $self->bridge->json;
@@ -1072,6 +1118,7 @@ sub __setAttr {
     my ($self,$attr,$value) = @_;
     die unless $self->__id;
     my $id = $self->__id;
+    $self->bridge->{stats}->{store}++;
     my $rn = $self->bridge->name;
     my $json = $self->bridge->json;
     $attr = $json->encode($attr);
@@ -1313,6 +1360,12 @@ sub new {
         id => $id,
         bridge => $bridge,
         release_action => $release_action,
+        stats => {
+            roundtrip => 0,
+            fetch => 0,
+            store => 0,
+            callback => 0,
+        },
     };
     bless $self, ref $package || $package;
 };
@@ -1705,7 +1758,7 @@ Max Maischein C<corion@cpan.org>
 
 =head1 COPYRIGHT (c)
 
-Copyright 2009-2010 by Max Maischein C<corion@cpan.org>.
+Copyright 2009-2011 by Max Maischein C<corion@cpan.org>.
 
 =head1 LICENSE
 
