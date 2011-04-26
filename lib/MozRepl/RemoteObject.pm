@@ -39,7 +39,7 @@ MozRepl::RemoteObject - treat Javascript objects as Perl objects
 =cut
 
 use vars qw[$VERSION $objBridge @CARP_NOT @EXPORT_OK $WARN_ON_LEAKS];
-$VERSION = '0.24';
+$VERSION = '0.25';
 
 @EXPORT_OK=qw[as_list];
 @CARP_NOT = (qw[MozRepl::RemoteObject::Instance
@@ -329,6 +329,18 @@ C<launch> option:
         launch => ['iceweasel','-repl','666']
     );
 
+=head3 Using a custom Mozrepl class
+
+By default, any class named in C<$ENV{MOZREPL}> will get loaded and used
+as the MozRepl backend. That value will get untainted!
+If you want to prevent C<$ENV{MOZREPL}>
+from getting used, pass an explicit class name using the C<repl_class>
+option.
+
+    MozRepl::RemoteObject->install_bridge(
+        repl_class => 'MozRepl::AnyEvent',
+    );
+
 =cut
 
 sub require_module($) {
@@ -341,9 +353,13 @@ sub install_bridge {
     my ($package, %options) = @_;
     $options{ repl } ||= $ENV{MOZREPL};
     my $repl_class = delete $options{ repl_class } || $ENV{MOZREPL_CLASS} || 'MozRepl';
+    # Untaint repl class
+    $repl_class =~ /^((?:\w+::)+\w+)$/
+        and $repl_class = $1;
     $options{ constants } ||= {};
     $options{ log } ||= [qw/ error/];
     $options{ queue } ||= [];
+    $options{ bufsize } ||= 10_240_000;
     $options{ use_queue } ||= 0; # > 0 means enqueue
     $options{ max_queue_size } ||= 5000; # mozrepl
                                          # / Net::Telnet don't like too large commands
@@ -372,6 +388,13 @@ sub install_bridge {
                     log => $options{ log },
                     plugins => { plugins => [qw[ JSON2 ]] }, # I'm loading my own JSON serializer
                 });
+                
+                if (my $bufsize = delete $options{ bufsize }) {
+                    if ($options{ repl }->repl->can('client')) {
+                        $options{ repl }->repl->client->telnet->max_buffer_length($bufsize);
+                    };
+                };
+
                 1;
             };
             if (! $ok ) {
@@ -782,13 +805,13 @@ use strict;
 use Carp qw(croak cluck);
 use Scalar::Util qw(blessed refaddr);
 use MozRepl::RemoteObject::Methods;
-push @Carp::CARP_NOT, __PACKAGE__;
+use vars qw(@CARP_NOT);
+@CARP_NOT = 'MozRepl::RemoteObject::Methods';
 
-# Move to ::methods
-use overload '%{}' => '__as_hash',
-             '@{}' => '__as_array',
-             '&{}' => '__as_code',
-             '=='  => '__object_identity',
+use overload '%{}' => 'MozRepl::RemoteObject::Methods::as_hash',
+             '@{}' => 'MozRepl::RemoteObject::Methods::as_array',
+             '&{}' => 'MozRepl::RemoteObject::Methods::as_code',
+             '=='  => 'MozRepl::RemoteObject::Methods::object_identity',
              '""'  => sub { overload::StrVal $_[0] };
 
 #sub TO_JSON {
@@ -862,7 +885,6 @@ sub AUTOLOAD {
     my $fn = $MozRepl::RemoteObject::Instance::AUTOLOAD;
     $fn =~ s/.*:://;
     my $self = shift;
-    #return $self->__invoke($fn,@_)
     return $self->MozRepl::RemoteObject::Methods::invoke($fn,@_)
 }
 
@@ -912,7 +934,7 @@ METHOD name contains characters not valid in a Perl variable name
 To invoke a Javascript objects native C<< __invoke >> method (if such a
 thing exists), please use:
 
-    $object->__invoke('__invoke', @args);
+    $object->MozRepl::RemoteObject::Methods::invoke::invoke('__invoke', @args);
 
 The same method can be used to call the Javascript functions with the
 same name as other convenience methods implemented
@@ -1045,13 +1067,15 @@ is identical to
 
 sub __attr {
     my ($self,$attr) = @_;
-    die "No id given" unless $self->__id;
-    $self->bridge->{stats}->{fetch}++;
-    my $id = $self->__id;
-    my $rn = $self->bridge->name;
-    my $json = $self->bridge->json;
+    my $id = MozRepl::RemoteObject::Methods::id($self)
+        or die "No id given";
+    
+    my $bridge = MozRepl::RemoteObject::Methods::bridge($self);
+    $bridge->{stats}->{fetch}++;
+    my $rn = $bridge->name;
+    my $json = $bridge->json;
     $attr = $json->encode($attr);
-    return $self->bridge->unjson(<<JS);
+    return $bridge->unjson(<<JS);
 $rn.getAttr($id,$attr)
 JS
 }
@@ -1071,11 +1095,12 @@ is identical to
 
 sub __setAttr {
     my ($self,$attr,$value) = @_;
-    die unless $self->__id;
-    my $id = $self->__id;
-    $self->bridge->{stats}->{store}++;
-    my $rn = $self->bridge->name;
-    my $json = $self->bridge->json;
+    my $id = MozRepl::RemoteObject::Methods::id($self)
+        or die "No id given";
+    my $bridge = $self->bridge;
+    $bridge->{stats}->{store}++;
+    my $rn = $bridge->name;
+    my $json = $bridge->json;
     $attr = $json->encode($attr);
     ($value) = $self->__transform_arguments($value);
     $self->bridge->js_call_to_perl_struct(<<JS);
@@ -1330,69 +1355,6 @@ sub new {
     bless $self, ref $package || $package;
 };
 
-sub __object_identity {
-    my ($self,$other) = @_;
-    return if (   ! $other 
-               or ! ref $other
-               or ! blessed $other
-               or ! $other->isa(__PACKAGE__));
-    die unless $self->__id;
-    my $left = $self->__id;
-    my $right = $other->__id;
-    my $rn = $self->bridge->name;
-    my $data = $self->bridge->js_call_to_perl_struct(<<JS);
-    // __object_identity
-$rn.getLink($left)===$rn.getLink($right)
-JS
-}
-
-# tied interface reflection
-
-=head2 C<< $obj->__as_hash() >>
-
-=head2 C<< $obj->__as_array() >>
-
-=head2 C<< $obj->__as_code() >>
-
-Returns a reference to a hash/array/coderef. This is used
-by L<overload>. Don't use these directly.
-
-=cut
-
-sub __as_hash {
-    my $self = shift;
-    tie my %h, 'MozRepl::RemoteObject::TiedHash', $self;
-    \%h;
-};
-
-sub __as_array {
-    my $self = shift;
-    tie my @a, 'MozRepl::RemoteObject::TiedArray', $self;
-    \@a;
-};
-
-sub __as_code {
-    my $self = shift;
-    my $class = ref $self;
-    bless $self, "$class\::HashAccess";
-    my $id = $self->{id};
-    my $context = $self->{ return_context }
-                ? qq{,"$self->{ return_context }"}
-                : '';
-    bless $self, $class;
-    return sub {
-        my (@args) = @_;
-        
-        my $rn = $self->bridge->name;
-        @args = $self->__transform_arguments(@args);
-        local $" = ',';
-        my $js = <<JS;
-    $rn.callThis($id,[@args]$context)
-JS
-        return $self->bridge->unjson($js);
-    };
-};
-
 package # don't index this on CPAN
   MozRepl::RemoteObject::TiedHash;
 use strict;
@@ -1453,6 +1415,26 @@ sub DELETE {
 JS
     $delete->($obj,$key);
 }
+
+sub CLEAR  {
+    my ($tied,$key) = @_;
+    my $obj = $tied->{impl};
+    my $clear = $obj->bridge->declare(<<'JS');
+    function(obj) {
+        var del = [];
+        for (var prop in obj) {
+            if (obj.hasOwnProperty(prop)) {
+                del.push(prop);
+            };
+        };
+        for (var i=0;i<del.length;i++) {
+            delete obj[del[i]]
+        };
+        return del
+    }
+JS
+    $clear->($obj);
+};
 
 1;
 

@@ -1,4 +1,4 @@
-#!perl -w
+#!perl -wT
 use strict;
 use Data::Dumper;
 use Test::More;
@@ -16,7 +16,7 @@ if (! $ok) {
     my $err = $@;
     plan skip_all => "Couldn't connect to MozRepl: $@";
 } else {
-    plan tests => 19;
+    plan tests => 25;
 };
 
 # create a nested object
@@ -90,3 +90,32 @@ JS
 #my $multi = $foo->__attr([qw[ bar foo ]]);
 #is scalar @$multi, 2, "Multi-fetch retrieves two values";
 #is $multi->[1], 1, "... and the second value is '1'";
+
+# Now also test complex assignment and retrieval
+$foo->{complex} = {
+    a => [ { nested => 'structure' } ]
+};
+ok $foo->{complex}, "We assign something to 'complex'";
+
+# And use JS to retrieve the structure
+my $get_complex = $repl->expr(<<JS);
+function(val) {
+    return val.complex.a[0].nested;
+}
+JS
+is $get_complex->($foo), 'structure',
+    "We can assign complex data structures from Perl and access them from JS";
+
+$ok = eval {
+    %$foo = (
+        flirble => 'bar',
+        fizz    => 'buzz',
+    );
+    1;
+};
+ok $ok, "We survive hash-list-assignment"
+    or diag $@;
+is_deeply [sort keys %$foo], [qw[fizz flirble]], "We get the correct keys";
+
+is $foo->{flirble}, 'bar', "Key assignment (flirble)";
+is $foo->{fizz}, 'buzz', "Key assignment (fizz)";
