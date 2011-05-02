@@ -39,7 +39,7 @@ MozRepl::RemoteObject - treat Javascript objects as Perl objects
 =cut
 
 use vars qw[$VERSION $objBridge @CARP_NOT @EXPORT_OK $WARN_ON_LEAKS];
-$VERSION = '0.25';
+$VERSION = '0.26';
 
 @EXPORT_OK=qw[as_list];
 @CARP_NOT = (qw[MozRepl::RemoteObject::Instance
@@ -390,8 +390,8 @@ sub install_bridge {
                 });
                 
                 if (my $bufsize = delete $options{ bufsize }) {
-                    if ($options{ repl }->repl->can('client')) {
-                        $options{ repl }->repl->client->telnet->max_buffer_length($bufsize);
+                    if ($options{ repl }->can('client')) {
+                        $options{ repl }->client->telnet->max_buffer_length($bufsize);
                     };
                 };
 
