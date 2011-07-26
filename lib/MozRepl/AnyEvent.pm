@@ -3,11 +3,11 @@ use strict;
 use AnyEvent;
 use AnyEvent::Handle;
 use AnyEvent::Strict;
+use Encode qw(decode);
 use Carp qw(croak);
-use MozRepl::Plugin::JSON2;
 
 use vars qw[$VERSION];
-$VERSION = '0.26';
+$VERSION = '0.27';
 
 =head1 NAME
 
@@ -124,16 +124,25 @@ sub setup_async {
     $options->{log} ||= [];
     my $cb = delete $options->{cv} || AnyEvent->condvar;
     
-    my $json = MozRepl::Plugin::JSON2->new();
-    
     $self->{log} = +{ map { $_ => 1 } @{$options->{ log }} };
     
-    my $hdl = $self->{hdl} || AnyEvent::Handle->new(
+    # Also enable the lower log levels
+    my @levels = qw( error warn info debug );
+    for (reverse(1..$#levels)) {
+        if ($self->{log}->{ $levels[ $_ ]}) {
+            $self->{log}->{ $levels[ $_-1 ]} = 1;
+        };
+    };
+    
+    my $hdl; $hdl = $self->{hdl} || AnyEvent::Handle->new(
         connect => [ $client->{host}, $client->{port} ],
+        #no_delay => 1, # reduce latency, seems to have no effect
         on_error => sub {
             $self->log('error',$_[2]);
             $self->{error} = $_[2];
             $cb->send();
+            delete $self->{hdl};
+            $_[0]->destroy;
             undef $cb;
             undef $self;
         },
@@ -148,17 +157,9 @@ sub setup_async {
                 $self->{name} = $1;
                 $self->log('debug', "Repl name is '$1'");
                 
-                # Load our JSON handler into Firefox
-                # Fake this so we can keep the same API
-                push @{ $self->{execute_stack}}, sub {
-                    # Tell anybody interested that we're connected now
-                    $self->log('debug', "Connected now");
-                    $cb->send($self)
-                };
-                
-                # This calls $self->execute, which pops the callback from 
-                # the stack and runs it
-                $json->setup( $self );
+                # Tell anybody interested that we're connected now
+                $self->log('debug', "Connected now");
+                $cb->send($self)
             });
         },
     );
@@ -181,10 +182,11 @@ sub setup {
     my ($self,$options) = @_;
     my $done = $self->setup_async($options);
     my @res = $done->recv;
-    if (not @res=$done->recv) {
+    if (not @res) {
         # reraise error
         die $self->{error}
     };
+    @res
 };
 
 =head2 C<< $repl->repl >>
@@ -232,9 +234,14 @@ sub execute_async {
     $self->hdl->push_read( regex => $self->{prompt}, 
         timeout => 10,
         sub {
-        $_[1] =~ s/$self->{prompt}$//;
-        $self->log(info => "Received data", $_[1]);
-        $cb->($_[1]);
+            $_[1] =~ s/$self->{prompt}$//;
+            #warn "<<$_[1]>>";
+            $self->log(info => "Received data", $_[1]);
+            # We could decode from UTF-8 here already,
+            # but that would mean differnt logic between
+            # MozRepl.pm and MozRepl::AnyEvent.pm
+            # $cb->(decode('UTF-8' => $_[1]));
+            $cb->($_[1]);
     });
     $cb
 };

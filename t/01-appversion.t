@@ -17,6 +17,8 @@ if (! $ok) {
     plan tests => 1;
 };
 
+diag "JS JSON encoder: $repl->{ js_JSON }";
+
 my $appinfo = $repl->appinfo;
 
 isa_ok $appinfo, 'MozRepl::RemoteObject::Instance',

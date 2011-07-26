@@ -3,7 +3,7 @@ use strict;
 use Scalar::Util qw(blessed);
 
 use vars qw[$VERSION];
-$VERSION = '0.26';
+$VERSION = '0.27';
 
 =head1 NAME
 
@@ -178,9 +178,9 @@ sub as_code {
     my $class = ref $self;
     my $id = id($self);
     my $context = hash_get($self, 'return_context');
-    $context = $context
-               ? qq{,"$context"}
-               : '';
+    #$context = $context
+    #           ? qq{,"$context"}
+    #           : '';
     return sub {
         my (@args) = @_;
         my $bridge = bridge($self);
@@ -189,9 +189,10 @@ sub as_code {
         @args = transform_arguments($self,@args);
         local $" = ',';
         my $js = <<JS;
-    $rn.callThis($id,[@args]$context)
+    $rn.callThis($id,[@args])
 JS
-        return $bridge->unjson($js);
+        #return $bridge->unjson($js,$context);
+        return $bridge->expr($js,$context);
     };
 };
 
@@ -207,8 +208,7 @@ sub object_identity {
     my $right = id($other);
     my $bridge = bridge($self);
     my $rn = $bridge->name;
-    my $data = $bridge->js_call_to_perl_struct(<<JS);
-    // __object_identity
+    my $data = $bridge->expr(<<JS);
 $rn.getLink($left)===$rn.getLink($right)
 JS
 }

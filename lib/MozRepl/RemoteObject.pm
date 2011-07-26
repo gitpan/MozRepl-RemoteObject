@@ -2,6 +2,7 @@ package MozRepl::RemoteObject;
 use strict;
 use Exporter 'import';
 use JSON;
+use Encode qw(decode);
 use Carp qw(croak cluck);
 use Scalar::Util qw(refaddr weaken);
 
@@ -39,7 +40,7 @@ MozRepl::RemoteObject - treat Javascript objects as Perl objects
 =cut
 
 use vars qw[$VERSION $objBridge @CARP_NOT @EXPORT_OK $WARN_ON_LEAKS];
-$VERSION = '0.26';
+$VERSION = '0.27';
 
 @EXPORT_OK=qw[as_list];
 @CARP_NOT = (qw[MozRepl::RemoteObject::Instance
@@ -81,9 +82,16 @@ repl.purgeLinks = function() {
     repl.linkedIdNext = 1;
 };
 
+repl.JSON_ok = function(val,context) {
+    return JSON.stringify({
+        "status":"ok",
+        "result": repl.wrapResults(val,context)
+    });
+};
+
 repl.getAttr = function(id,attr) {
     var v = repl.getLink(id)[attr];
-    return repl.wrapResults(v)
+    return v
 };
 
 repl.wrapValue = function(v,context) {
@@ -133,21 +141,22 @@ repl.dive = function(id,elts) {
             throw "Cannot dive: " + last + "." + e + " is empty.";
         };
     };
-    return repl.wrapResults(obj)
+    return obj
 };
 
-repl.callThis = function(id,args,context) {
+repl.callThis = function(id,args) {
     var obj = repl.getLink(id);
-    return repl.wrapResults(obj.apply(obj, args),context);
+    var res = obj.apply(obj, args);
+    return res
 };
 
-repl.callMethod = function(id,fn,args,context) { 
+repl.callMethod = function(id,fn,args) { 
     var obj = repl.getLink(id);
     var f = obj[fn];
     if (! f) {
         throw "Object has no function " + fn;
     }
-    return repl.wrapResults(f.apply(obj, args),context);
+    return f.apply(obj, args);
 };
 
 
@@ -161,6 +170,31 @@ repl.makeCatchEvent = function(myid) {
                 args : repl.link(myargs)
             });
         };
+};
+
+repl.q = function (queue) {
+    try {
+        eval(queue);
+    } catch(e) {
+        // Silently eat those errors
+        // alert("Error in queue: " + e.message + "["+queue+"]");
+    };
+};
+
+repl.ejs = function (js,context) {
+    try {
+        var res = eval(js);
+        return repl.JSON_ok(res,context);
+    } catch(e) {
+        //for (var x in e) { alert(x)};
+        return JSON.stringify({
+            "status":"error",
+            "name": e.name,
+            "message": e.message ? e.message : e,
+            //"line":e.lineNumber,
+            "command":js
+        });
+    };
 };
 
 // This should return links to all installed functions
@@ -192,16 +226,19 @@ sub to_perl {
         warn "Got empty string from REPL";
         return;
     }
-    $js = $_;
+
+    # In the case that we don't have a unicode string
+    # already, decode the string from UTF-8
+    $js = decode('UTF-8', $_);
     #warn "[[$_]]";
-    # effin' .toSource() sends us \xHH escapes, and JSON doesn't
-    # know what to do with them. So I pass them through unharmed :-(
-    #s/\\x/\\u00/g; # this is not safe against \\xHH, but at the moment I don't care
     my $res;
     local $@;
     my $json = $self->json;
     if (! eval {
+        
         $res = $json->decode($js);
+        #use Data::Dumper;
+        #warn Dumper $res;
         1
     }) {
         my $err = $@;
@@ -227,6 +264,7 @@ sub unwrap_json_result {
             $self->{stats}->{callback}++;
             ($ev->{args}) = $self->link_ids($ev->{args});
             $self->dispatch_callback($ev);
+            undef $ev; # release the memory early!
         };
     };
     my $t = $data->{type} || '';
@@ -245,8 +283,8 @@ sub unwrap_json_result {
 
 # Call JS and return the unwrapped result
 sub unjson {
-    my ($self,$js) = @_;
-    my $data = $self->js_call_to_perl_struct($js);
+    my ($self,$js,$context) = @_;
+    my $data = $self->js_call_to_perl_struct($js,$context);
     return $self->unwrap_json_result($data);    
 };
 
@@ -256,7 +294,7 @@ sub unjson {
 
 Installs the Javascript C<< <-> >> Perl bridge. If you pass in
 an existing L<MozRepl> instance, it must have L<MozRepl::Plugin::JSON2>
-loaded.
+loaded if you're running on a browser without native JSON support.
 
 If C<repl> is not passed in, C<$ENV{MOZREPL}> will be used
 to find the ip address and portnumber to connect to. If C<$ENV{MOZREPL}>
@@ -341,6 +379,20 @@ option.
         repl_class => 'MozRepl::AnyEvent',
     );
 
+=head3 Preventing/forcing native JSON
+
+The Javascript part of MozRepl::RemoteObject will try to detect whether
+to use the native Mozilla C<JSON> object or whether to supply its own
+JSON encoder from L<MozRepl::Plugin::JSON2>. To prevent the autodetection,
+pass the C<js_JSON> option:
+
+  js_JSON => 'native', # force to use the native JSON object
+
+  js_JSON => '', # force the json2.js encoder
+
+The autodetection detects whether the connection has a native JSON
+encoder and whether it properly transports UTF-8.
+
 =cut
 
 sub require_module($) {
@@ -361,7 +413,7 @@ sub install_bridge {
     $options{ queue } ||= [];
     $options{ bufsize } ||= 10_240_000;
     $options{ use_queue } ||= 0; # > 0 means enqueue
-    $options{ max_queue_size } ||= 5000; # mozrepl
+    $options{ max_queue_size } ||= 1000; # mozrepl
                                          # / Net::Telnet don't like too large commands
 
     if (! ref $options{repl}) { # we have host:port
@@ -386,7 +438,7 @@ sub install_bridge {
                         }
                     },
                     log => $options{ log },
-                    plugins => { plugins => [qw[ JSON2 ]] }, # I'm loading my own JSON serializer
+                    plugins => { plugins => [] },
                 });
                 
                 if (my $bufsize = delete $options{ bufsize }) {
@@ -412,6 +464,59 @@ sub install_bridge {
                 }
             }
         };
+    };
+    
+    if(! exists $options{ js_JSON }) {
+        # Autodetect whether we need the custom JSON serializer
+        
+        # It's required on Firefox 3.0 only
+        my $capabilities = $options{ repl }->execute(
+          join "",
+              # Extract version
+              'Components.classes["@mozilla.org/xre/app-info;1"].',
+              'getService(Components.interfaces.nsIXULAppInfo).version+"!"',
+              # Native JSON object available?
+              q{+eval("var r;try{r=JSON.stringify('\u30BD');}catch(e){r=''};r")},
+               # UTF-8 transport detection
+              '+"!\u30BD"',
+              ";\n" 
+        );
+        $capabilities =~ s/^"(.*)"\s*$/$1/;
+        $capabilities =~ s/^"//;
+        $capabilities =~ s/"$//;
+        #warn "Capabilities: [$capabilities]";
+        my ($version, $have_native, $unicode) = split /!/, $capabilities;
+    
+        #warn $unicode;
+        #warn sprintf "%02x",$_ for map{ord} split //, $unicode;
+        if ($have_native eq '') {
+            $options{ js_JSON } ||= "json2; No native JSON object found ($version)";
+        };
+        if( lc $have_native eq lc q{"\u30bd"} # values get escaped
+            or $have_native eq qq{"\x{E3}\x{82}\x{BD}"} # values get encoded as UTF-8
+          ) {
+            # so we can transport unicode properly
+            $options{ js_JSON } ||= 'native';
+        } else {
+            $options{ js_JSON } ||= "json2; Transport not UTF-8-safe";
+        };
+    };
+    
+    if ($options{ js_JSON } ne 'native') {
+        # send our own JSON encoder
+        #warn "Installing custom JSON encoder ($options{ native_JSON })";
+        require MozRepl::Plugin::JSON2;
+        
+        my $json2 = MozRepl::Plugin::JSON2->new()->process('setup');
+        $options{ repl }->execute($json2);
+        
+        # Now, immediately check whether our transport is UTF-8 safe:
+        my $utf8 = $options{ repl }->execute(
+              q{JSON.stringify('\u30BD')}.";\n"
+        );
+        $utf8 =~ s/\s*$//;
+        lc $utf8 eq lc q{""\u30bd""}
+            or warn "Transport still not UTF-8 safe: [$utf8]";
     };
     
     my $rn = $options{repl}->repl;
@@ -462,18 +567,17 @@ as list. To do that, specify C<'list'> as the C<$context> parameter:
 
 sub expr_js {
     my ($self,$js,$context) = @_;
-    $js = $self->json->encode($js);
+    #$js = $self->json->encode($js);
     my $rn = $self->name;
     return '' unless $rn; # If we have no repl (name), we can't do anything anyway
-    if ($context) { $context=qq{,"$context"}} else {
-        $context='';
-    };
+    #if ($context) { $context=qq{"$context"}} else {
+    #    $context='""';
+    #};
 #warn "($rn)";
-    $js = <<JS;
-    (function(repl,code) {
-        return repl.wrapResults(eval(code)$context)
-    })($rn,$js)
-JS
+#    $js = <<JS;
+#$rn.ejs($js,$context)
+#JS
+    ($js,$context)
 }
 
 # This is used by ->declare() so can't use it itself
@@ -658,7 +762,7 @@ sub appinfo {
 JS
 };
 
-=head2 C<< $bridge->js_call_to_perl_struct $js >>
+=head2 C<< $bridge->js_call_to_perl_struct( $js, $context ) >>
 
 Takes a scalar with JS code, executes it, and returns
 the result as a Perl structure.
@@ -671,34 +775,41 @@ This is a very low level method. You are better advised to use
 C<< $bridge->expr() >> as that will know
 to properly wrap objects but leave other values alone.
 
+C<$context> is passed through and tells the Javascript side
+whether to return arrays as objects or as lists. Pass
+C<list> if you want a list of results instead of a reference
+to a Javascript C<array> object.
+
 =cut
 
+sub repl_API {
+    my ($self,$call,@args) = @_;
+    return sprintf q<%s.%s(%s);>, $self->repl->repl, $call, join ",", map { $self->json->encode($_) } @args;
+};
+
 sub js_call_to_perl_struct {
-    my ($self,$js) = @_;
+    my ($self,$js,$context) = @_;
+    $context ||= '';
     $self->{stats}->{roundtrip}++;
     my $repl = $self->repl;
     if (! $repl) {
         # Likely during global destruction
         return
     };
-    my $queue_pre = '';
-    my $queue_post = '';
-    if (@{ $self->queue }) {
-        # This should become ->flush_queue()
-        # Wrap all queued commands in a function,
-        # together with the payload command, so we only get one result
-        $queue_pre = join '',
-                     "(function(){",
-                     map( { /;$/? $_ : "$_;" } map { s/\s*$//; $_ } @{ $self->queue }),
-                     "return ";
-        $queue_post = "})()";
+    my $queue = join '',
+                     map( { /;$/? $_ : "$_;" } map { s/\s*$//; $_ } @{ $self->queue });
         
-        @{ $self->queue } = ();
-    };
+    @{ $self->queue } = ();
+
     #warn "<<$js>>";
+    my @js;
+    if ($queue) {
+        push @js, $self->repl_API('q', $queue);
+    };
+    push @js, $self->repl_API('ejs', $js, $context );
+    $js = join ";", @js;
+    
     if (defined wantarray) {
-        #warn "Returning result of $js";
-        $js = "${queue_pre}JSON.stringify( function(){ var res = $js; return { result: res }}())$queue_post";
         #warn $js;
         # When going async, we would want to turn this into a callback
         my $res = $repl->execute($js);
@@ -710,10 +821,15 @@ sub js_call_to_perl_struct {
             $res =~ s/^(?:\.+\>\s+)+//g;
         };
         my $d = $self->to_perl($res);
-        return $d->{result}
+        if ($d->{status} eq 'ok') {
+            return $d->{result}
+        } else {
+            croak ((ref $self).": $d->{name}: $d->{message}");
+        };
     } else {
         #warn "Executing $js";
         # When going async, we would want to turn this into a callback
+        # This produces additional, bogus prompts...
         $repl->execute($js);
         ()
     };
@@ -1042,7 +1158,7 @@ sub DESTROY {
 (function(repl,id){${release_action}repl.breakLink(id)})($rn,$id)
 JS
         } else {
-        #    warn "Repl '$rn' has gone away already";
+            warn "Repl '$rn' has gone away already";
         };
         1
     } else {
@@ -1066,7 +1182,7 @@ is identical to
 =cut
 
 sub __attr {
-    my ($self,$attr) = @_;
+    my ($self,$attr,$context) = @_;
     my $id = MozRepl::RemoteObject::Methods::id($self)
         or die "No id given";
     
@@ -1075,7 +1191,7 @@ sub __attr {
     my $rn = $bridge->name;
     my $json = $bridge->json;
     $attr = $json->encode($attr);
-    return $bridge->unjson(<<JS);
+    return $bridge->unjson(<<JS,$context);
 $rn.getAttr($id,$attr)
 JS
 }
