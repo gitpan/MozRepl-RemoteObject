@@ -3,7 +3,7 @@ use strict;
 use Exporter 'import';
 use JSON;
 use Encode qw(decode);
-use Carp qw(croak cluck);
+use Carp qw(croak);
 use Scalar::Util qw(refaddr weaken);
 
 =head1 NAME
@@ -40,7 +40,7 @@ MozRepl::RemoteObject - treat Javascript objects as Perl objects
 =cut
 
 use vars qw[$VERSION $objBridge @CARP_NOT @EXPORT_OK $WARN_ON_LEAKS];
-$VERSION = '0.28';
+$VERSION = '0.29';
 
 @EXPORT_OK=qw[as_list];
 @CARP_NOT = (qw[MozRepl::RemoteObject::Instance
@@ -520,7 +520,7 @@ sub install_bridge {
         );
         $utf8 =~ s/\s*$//;
         lc $utf8 eq lc q{""\u30bd""}
-            or warn "Transport still not UTF-8 safe: [$utf8]";
+            or warn "Transport still not UTF-8 safe: [$utf8].\nDo you have mozrepl 1.1.0 or later installed?";
     };
     
     my $rn = $options{repl}->repl;
@@ -588,25 +588,10 @@ as list. To do that, specify C<'list'> as the C<$context> parameter:
 
 =cut
 
-sub expr_js {
-    my ($self,$js,$context) = @_;
-    #$js = $self->json->encode($js);
-    my $rn = $self->name;
-    return '' unless $rn; # If we have no repl (name), we can't do anything anyway
-    #if ($context) { $context=qq{"$context"}} else {
-    #    $context='""';
-    #};
-#warn "($rn)";
-#    $js = <<JS;
-#$rn.ejs($js,$context)
-#JS
-    ($js,$context)
-}
-
 # This is used by ->declare() so can't use it itself
 sub expr {
     my ($self,$js,$context) = @_;
-    return $self->unjson($self->expr_js($js,$context));
+    return $self->unjson($js,$context);
 }
 
 # the queue stuff is left undocumented because it's
@@ -942,7 +927,7 @@ sub poll {
 package # hide from CPAN
     MozRepl::RemoteObject::Instance;
 use strict;
-use Carp qw(croak cluck);
+use Carp qw(croak);
 use Scalar::Util qw(blessed refaddr);
 use MozRepl::RemoteObject::Methods;
 use vars qw(@CARP_NOT);
