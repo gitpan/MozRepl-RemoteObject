@@ -14,7 +14,7 @@ the MozRepl::RemoteObject JSON encoding/decoding.
 
 =cut
 
-$VERSION = '0.30';
+$VERSION = '0.31';
 
 sub setup {
     my ($self, $ctx, $args) = @_;
@@ -64,7 +64,7 @@ Max Maischein C<corion@cpan.org>
 
 =head1 COPYRIGHT (c)
 
-Copyright 2009-2011 by Max Maischein C<corion@cpan.org>.
+Copyright 2009-2012 by Max Maischein C<corion@cpan.org>.
 
 =head1 LICENSE
 

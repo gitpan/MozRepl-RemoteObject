@@ -40,7 +40,7 @@ MozRepl::RemoteObject - treat Javascript objects as Perl objects
 =cut
 
 use vars qw[$VERSION $objBridge @CARP_NOT @EXPORT_OK $WARN_ON_LEAKS];
-$VERSION = '0.30';
+$VERSION = '0.31';
 
 @EXPORT_OK=qw[as_list];
 @CARP_NOT = (qw[MozRepl::RemoteObject::Instance
@@ -1282,11 +1282,18 @@ is identical to
 sub __keys { # or rather, __properties
     my ($self,$attr) = @_;
     die unless $self;
+    
+    # We do not want to rely on the object actually supporting
+    # .hasOwnProperty, so we support both, it having .hasOwnProperty
+    # and using Object.hasOwnProperty
     my $getKeys = $self->bridge->declare(<<'JS', 'list');
     function(obj){
         var res = [];
+        var hop = // obj.hasOwnProperty
+                  Object.hasOwnProperty
+                  ;
         for (var el in obj) {
-            if (obj.hasOwnProperty(el)) {
+            if (hop.apply(obj, [el])){
                 res.push(el);
             };
         }
@@ -1826,7 +1833,7 @@ Max Maischein C<corion@cpan.org>
 
 =head1 COPYRIGHT (c)
 
-Copyright 2009-2011 by Max Maischein C<corion@cpan.org>.
+Copyright 2009-2012 by Max Maischein C<corion@cpan.org>.
 
 =head1 LICENSE
 

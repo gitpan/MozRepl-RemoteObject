@@ -7,7 +7,7 @@ use Encode qw(decode);
 use Carp qw(croak);
 
 use vars qw[$VERSION];
-$VERSION = '0.30';
+$VERSION = '0.31';
 
 =head1 NAME
 
@@ -283,7 +283,7 @@ Max Maischein C<corion@cpan.org>
 
 =head1 COPYRIGHT (c)
 
-Copyright 2009-2011 by Max Maischein C<corion@cpan.org>.
+Copyright 2009-2012 by Max Maischein C<corion@cpan.org>.
 
 =head1 LICENSE
 
