@@ -3,7 +3,7 @@ use strict;
 use Scalar::Util qw(blessed);
 
 use vars qw[$VERSION];
-$VERSION = '0.31';
+$VERSION = '0.32';
 
 =head1 NAME
 
@@ -178,9 +178,6 @@ sub as_code {
     my $class = ref $self;
     my $id = id($self);
     my $context = hash_get($self, 'return_context');
-    #$context = $context
-    #           ? qq{,"$context"}
-    #           : '';
     return sub {
         my (@args) = @_;
         my $bridge = bridge($self);
@@ -191,7 +188,6 @@ sub as_code {
         my $js = <<JS;
     $rn.callThis($id,[@args])
 JS
-        #return $bridge->unjson($js,$context);
         return $bridge->expr($js,$context);
     };
 };
@@ -210,6 +206,95 @@ sub object_identity {
     my $rn = $bridge->name;
     my $data = $bridge->expr(<<JS);
 $rn.getLink($left)===$rn.getLink($right)
+JS
+}
+
+=head2 C<< $obj->MozRepl::RemoteObject::Methods::xpath( $query [, $ref, $cont ] ) >>
+
+Executes an XPath query and returns the node
+snapshot result as a list.
+
+This is a convenience method that should only be called
+on HTMLdocument nodes.
+
+The optional C<$ref> parameter can be a DOM node relative to which a
+relative XPath expression will be evaluated. It defaults to C<undef>.
+
+The optional C<$cont> parameter can be a Javascript function that
+will get applied to every result. This can be used to directly map
+each DOM node in the XPath result to an attribute. For example
+for efficiently fetching the text value of an XPath query resulting in
+textnodes, the two snippets are equivalent, but the latter executes
+less roundtrips between Perl and Javascript:
+
+    my @text = map { $_->{nodeValue} }
+        $obj->MozRepl::RemoteObject::Methods::xpath( '//p/text()' )
+
+
+    my $fetch_nodeValue = $bridge->declare(<<JS);
+        function (e){ return e.nodeValue }
+    JS
+    my @text = map { $_->{nodeValue} }
+        $obj->MozRepl::RemoteObject::Methods::xpath( '//p/text()', undef, $fetch_nodeValue )
+
+=cut
+
+sub xpath {
+    my ($self,$query,$ref,$cont) = @_; # $self is a HTMLdocument
+    $ref ||= $self;
+    my $js = <<'JS';
+    function(doc,q,ref,cont) {
+        var xres = doc.evaluate(q,ref,null,XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null );
+        var map;
+        if( cont ) {
+            map = cont;
+        } else {
+            // Default is identity
+            map = function(e){ return e };
+        };
+        var res = [];
+        for ( var i=0 ; i < xres.snapshotLength; i++ )
+        {
+            res.push( map(xres.snapshotItem(i)));
+        };
+        return res
+    }
+JS
+    my $snap = $self->bridge->declare($js,'list');
+    $snap->($self,$query,$ref,$cont);
+}
+
+
+=head2 C<< MozRepl::RemoteObject::Methods::dive($obj) >>
+
+Convenience method to quickly dive down a property chain.
+
+If any element on the path is missing, the method dies
+with the error message which element was not found.
+
+This method is faster than descending through the object
+forest with Perl, but otherwise identical.
+
+  my $obj = $tab->{linkedBrowser}
+                ->{contentWindow}
+                ->{document}
+                ->{body}
+
+  my $obj = $tab->MozRepl::RemoteObject::Methods::dive(
+      qw(linkedBrowser contentWindow document body)
+  );
+
+=cut
+
+sub dive {
+    my ($self,@path) = @_;
+    my $id = id($self);
+    die unless $id;
+    my $rn = bridge($self)->name;
+    (my $path) = transform_arguments($self,\@path);
+    
+    my $data = bridge($self)->unjson(<<JS);
+$rn.dive($id,$path)
 JS
 }
 

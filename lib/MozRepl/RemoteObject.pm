@@ -40,7 +40,7 @@ MozRepl::RemoteObject - treat Javascript objects as Perl objects
 =cut
 
 use vars qw[$VERSION $objBridge @CARP_NOT @EXPORT_OK $WARN_ON_LEAKS];
-$VERSION = '0.31';
+$VERSION = '0.32';
 
 @EXPORT_OK=qw[as_list];
 @CARP_NOT = (qw[MozRepl::RemoteObject::Instance
@@ -577,6 +577,7 @@ You can also create Javascript functions and use them from Perl:
       function (a,b) { return a+b }
   JS
   print $add->(2,3);
+  # prints 5
 
 The C<context> parameter allows you to specify that you
 expect a Javascript array and want it to be returned
@@ -585,6 +586,9 @@ as list. To do that, specify C<'list'> as the C<$context> parameter:
   for ($bridge->expr(<<JS,'list')) { print $_ };
       [1,2,3,4]
   JS
+
+This is slightly more efficient than passing back an array reference
+and then fetching all elements.
 
 =cut
 
@@ -631,7 +635,9 @@ functionally equivalent to writing
     @$array
 
 except that it involves much less roundtrips between Javascript
-and Perl.
+and Perl. If you find yourself using this, consider
+declaring a Javascript function with C<list> context
+by using C<< ->declare >> instead.
 
 =cut
 
@@ -698,6 +704,8 @@ until the bridge is torn down.
 
 If you expect an array to be returned and want the array
 to be fetched as list, pass C<'list'> as the C<$context>.
+This is slightly more efficient than passing an array reference
+to Perl and fetching the single elements from Perl.
 
 =cut
 
@@ -833,6 +841,7 @@ sub js_call_to_perl_struct {
         if ($d->{status} eq 'ok') {
             return $d->{result}
         } else {
+            no warnings 'uninitialized';
             croak ((ref $self).": $d->{name}: $d->{message}");
         };
     } else {
@@ -1050,6 +1059,13 @@ many fronts so that has been postponed.
 
 =head1 OBJECT METHODS
 
+These methods are considered to be internal. You usually
+do not want to call them from your code. They are
+documented here for the rare case you might need to use them directly
+instead of treating the objects as Perl structures. The
+official way to access these functions is by using
+L<MozRepl::RemoteObject::Methods> instead.
+
 =head2 C<< $obj->__invoke(METHOD, ARGS) >>
 
 The C<< ->__invoke() >> object method is an alternate way to
@@ -1236,6 +1252,9 @@ JS
 
 =head2 C<< $obj->__dive( @PATH ) >>
 
+B<DEPRECATED> - this method will vanish somewhere after 0.23.
+Use L<MozRepl::RemoteObject::Methods::dive> instead.
+
 Convenience method to quickly dive down a property chain.
 
 If any element on the path is missing, the method dies
@@ -1253,29 +1272,23 @@ forest with Perl, but otherwise identical.
 
 =cut
 
-sub __dive {
-    my ($self,@path) = @_;
-    die unless $self->__id;
-    my $id = $self->__id;
-    my $rn = $self->bridge->name;
-    (my $path) = $self->__transform_arguments(\@path);
-    
-    my $data = $self->bridge->unjson(<<JS);
-$rn.dive($id,$path)
-JS
-}
+*__dive = \&MozRepl::RemoteObject::Methods::dive;
 
 =head2 C<< $obj->__keys() >>
 
-Returns the names of all properties
-of the javascript object as a list.
+Please use instead:
+
+    keys %$obj
+
+The function returns the names of all properties
+of the javascript object as a list, just like the C<keys>
+Perl function.
 
   $obj->__keys()
 
 is identical to
 
   keys %$obj
-
 
 =cut
 
@@ -1305,6 +1318,10 @@ JS
 
 =head2 C<< $obj->__values() >>
 
+Please use instead:
+
+    values %$obj
+
 Returns the values of all properties
 as a list.
 
@@ -1333,7 +1350,7 @@ JS
 
 =head2 C<< $obj->__xpath( $query [, $ref ] ) >>
 
-B<DEPRECATED> - this method will vanish in 0.23.
+B<DEPRECATED> - this method will vanish somewhere after 0.23.
 Use L<MozRepl::RemoteObject::Methods::xpath> instead:
 
   $obj->MozRepl::RemoteObject::Methods::xpath( $query )
@@ -1344,25 +1361,29 @@ snapshot result as a list.
 This is a convenience method that should only be called
 on HTMLdocument nodes.
 
+The optional C<$ref> parameter can be a DOM node relative to which a
+relative XPath expression will be evaluated. It defaults to C<undef>.
+
+The optional C<$cont> parameter can be a Javascript function that
+will get applied to every result. This can be used to directly map
+each DOM node in the XPath result to an attribute. For example
+for efficiently fetching the text value of an XPath query resulting in
+textnodes, the two snippets are equivalent, but the latter executes
+less roundtrips between Perl and Javascript:
+
+    my @text = map { $_->{nodeValue} }
+        $obj->MozRepl::RemoteObject::Methods::xpath( '//p/text()' )
+
+
+    my $fetch_nodeValue = $bridge->declare(<<JS);
+        function (e){ return e.nodeValue }
+    JS
+    my @text = map { $_->{nodeValue} }
+        $obj->MozRepl::RemoteObject::Methods::xpath( '//p/text()', undef, $fetch_nodeValue )
+
 =cut
 
-sub __xpath {
-    my ($self,$query,$ref) = @_; # $self is a HTMLdocument
-    $ref ||= $self;
-    my $js = <<'JS';
-    function(doc,q,ref) {
-        var xres = doc.evaluate(q,ref,null,XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null );
-        var res = [];
-        for ( var i=0 ; i < xres.snapshotLength; i++ )
-        {
-            res.push( xres.snapshotItem(i));
-        };
-        return res
-    }
-JS
-    my $snap = $self->bridge->declare($js,'list');
-    $snap->($self,$query,$ref);
-}
+*__xpath = \&MozRepl::RemoteObject::Methods::xpath;
 
 =head2 C<< $obj->__click >>
 
@@ -1741,13 +1762,6 @@ Consider using/supporting L<AnyEvent> for better compatibility
 with other mainloops.
 
 This would lead to implementing a full two-way message bus.
-
-=item *
-
-Consider implementing a mozrepl "interactor" to remove
-the prompting of C<mozrepl> alltogether.
-Interactors only exist in the development releases
-of C<mozrepl>.
 
 =item *
 
