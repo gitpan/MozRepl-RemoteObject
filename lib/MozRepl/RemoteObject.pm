@@ -40,7 +40,7 @@ MozRepl::RemoteObject - treat Javascript objects as Perl objects
 =cut
 
 use vars qw[$VERSION $objBridge @CARP_NOT @EXPORT_OK $WARN_ON_LEAKS];
-$VERSION = '0.32';
+$VERSION = '0.33';
 
 @EXPORT_OK=qw[as_list];
 @CARP_NOT = (qw[MozRepl::RemoteObject::Instance
@@ -1438,8 +1438,13 @@ sub __event {
     if ($type eq 'click') {
         $fn = $self->bridge->declare(<<'JS');
         function(target,name) {
+            if( target.click ) {
+                target.click();
+                return;
+            };
+            
             var event = target.ownerDocument.createEvent('MouseEvents');
-            event.initMouseEvent(name, true, true, window,
+            event.initMouseEvent(name, true, true, target.ownerDocument.defaultView,
                                  0, 0, 0, 0, 0, false, false, false,
                                  false, 0, null);
             target.dispatchEvent(event);

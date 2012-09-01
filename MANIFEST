@@ -45,4 +45,5 @@ t/99-todo.t
 t/99-unix-text.t
 t/99-versions.t
 t/sync-callbacks.html
-META.yml                                 Module meta-data (added by MakeMaker)
+META.yml                                 Module YAML meta-data (added by MakeMaker)
+META.json                                Module JSON meta-data (added by MakeMaker)
