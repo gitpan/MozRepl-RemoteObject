@@ -10,10 +10,12 @@ my $ok = eval {
 };
 my $err = $@;
 
-my $arepl;
-$ok and $ok = eval {
-    $arepl = MozRepl::AnyEvent->new();
-    $arepl->setup();
+my $repl;
+$ok = eval {
+    $repl = MozRepl::RemoteObject->install_bridge(
+        #repl => $arepl,
+        repl_class => 'MozRepl::AnyEvent',
+    );
     1;
 };
 if (! $ok) {
@@ -23,11 +25,7 @@ if (! $ok) {
     plan tests => 5;
 };
 
-isa_ok $arepl, 'MozRepl::AnyEvent';
-
-my $repl = MozRepl::RemoteObject->install_bridge(
-    repl => $arepl,
-);
+isa_ok $repl->repl, 'MozRepl::AnyEvent', 'We installed the class we passed in';
 
 my $four = $repl->expr(<<JS);
     2+2
@@ -44,7 +42,7 @@ my $identity = $repl->expr(<<JS);
     repl === repl.getLink($repl_id)
 JS
 
-is $identity, 'true', "Object identity in Javascript works";
+ok $identity, "Object identity in Javascript works";
 
 my $adder = $repl->expr(<<JS);
     f=function(a,b) { return a+b };f

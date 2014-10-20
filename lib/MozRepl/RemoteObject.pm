@@ -40,7 +40,7 @@ MozRepl::RemoteObject - treat Javascript objects as Perl objects
 =cut
 
 use vars qw[$VERSION $objBridge @CARP_NOT @EXPORT_OK $WARN_ON_LEAKS];
-$VERSION = '0.37';
+$VERSION = '0.38';
 
 @EXPORT_OK=qw[as_list];
 @CARP_NOT = (qw[MozRepl::RemoteObject::Instance
@@ -1395,8 +1395,8 @@ on HTMLdocument nodes or their children.
 =cut
 
 sub __click {
-    my ($self) = @_; # $self is a HTMLdocument or a descendant!
-    $self->__event('click');
+    my ($self, @args) = @_; # $self is a HTMLdocument or a descendant!
+    $self->__event('click', @args);
 }
 
 =head2 C<< $obj->__change >>
@@ -1433,19 +1433,21 @@ user entering a value into a field:
 =cut
 
 sub __event {
-    my ($self,$type) = @_;
+    my ($self,$type,@args) = @_;
     my $fn;
     if ($type eq 'click') {
         $fn = $self->bridge->declare(<<'JS');
-        function(target,name) {
-            if( target.click ) {
-                target.click();
-                return;
-            };
+        function(target,name,x,y) {
+            //if( target.click && !x && !y) {
+            //    target.click();
+            //    return;
+            //};
+            if(!x) x= 0;
+            if(!y) y= 0;
             
             var event = target.ownerDocument.createEvent('MouseEvents');
             event.initMouseEvent(name, true, true, target.ownerDocument.defaultView,
-                                 0, 0, 0, 0, 0, false, false, false,
+                                 null, 0, 0, x, y, false, false, false,
                                  false, 0, null);
             target.dispatchEvent(event);
         }
@@ -1459,7 +1461,8 @@ JS
     }
 JS
     };
-    $fn->($self,$type);
+    #$fn->($self,"mouseup",@args);
+    $fn->($self,$type,@args);
 };
 
 =head2 C<< MozRepl::RemoteObject::Instance->new( $bridge, $ID, $onDestroy ) >>
